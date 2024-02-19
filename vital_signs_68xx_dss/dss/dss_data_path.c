@@ -467,7 +467,7 @@ uint8_t gMmwL1[MMW_L1_HEAP_SIZE];
 
 /* Vital Signs Prams */
 
-static uint32_t gFrameCount=0;
+static uint32_t gFrameCount;
 
 void MmwDemo_genWindow(void *win,
                         uint32_t windowDatumType,
@@ -2259,7 +2259,17 @@ void MmwDemo_interChirpProcessing(MmwDemo_DSS_DataPathObj *obj, uint8_t chirpPin
                 (int16_t *) &obj->adcDataIn[pingPongId(antIndx) * obj->numRangeBins],
                 (int16_t *) &obj->fftOut1D[chirpPingPongId * (obj->numRxAntennas * obj->numRangeBins) +
                     (obj->numRangeBins * antIndx)]);
-
+        if(obj->chirpCount == 0){
+            memset((void *)&obj->meanfft[0],
+                        0 , obj->numRxAntennas * obj->numRangeBins * sizeof(cmplx16ReIm_t));
+        }
+        int16_t rangeBinIndex=0;
+        for(;rangeBinIndex<obj->numRangeBins;++rangeBinIndex){
+            obj->meanfft[antIndx * obj->numRangeBins + rangeBinIndex].real += obj->fftOut1D[chirpPingPongId * (obj->numRxAntennas * obj->numRangeBins)
+                                                                                            + (obj->numRangeBins * antIndx) + rangeBinIndex].real;
+            obj->meanfft[antIndx * obj->numRangeBins + rangeBinIndex].imag += obj->fftOut1D[chirpPingPongId * (obj->numRxAntennas * obj->numRangeBins)
+                                                                                            + (obj->numRangeBins * antIndx) + rangeBinIndex].imag;
+        }
     }
 
     if(obj->cliCfg->calibDcRangeSigCfg.enabled)
@@ -2594,207 +2604,355 @@ void Re16bitIm16bit_swap(cmplx16ReIm_t *input,
  *  @retval
  *      Not Applicable.
  */
-void MmwDemo_interFrameProcessing(MmwDemo_DSS_DataPathObj *obj)
+void MmwDemo_interFrameProcessing(MmwDemo_DSS_DataPathObj *obj, uint32_t frameIntSkipCounter)
 {
-        //Vital Signs Demo Processing Chain
+    //Vital Signs Demo Processing Chain
 
-        gFrameCount++;                         // Increment the Global Frame Count
-        //static uint16_t frameCountLocal;       // Local circular count
-        uint16_t loopIndexBuffer;              // Index that loops over the buffers
+    gFrameCount++;                         // Increment the Global Frame Count
+    uint16_t loopIndexBuffer;              // Index that loops over the buffers
 
-        /* Obtain GUI-related Flags sent through the CLI */
-        VitalSignsDemo_GuiMonSel *pGuiMonSel;
-        pGuiMonSel = (VitalSignsDemo_GuiMonSel *) &(obj->cliCfg->vitalSigns_GuiMonSel);
+    /* Obtain GUI-related Flags sent through the CLI */
+    VitalSignsDemo_GuiMonSel *pGuiMonSel;
+    pGuiMonSel = (VitalSignsDemo_GuiMonSel *) &(obj->cliCfg->vitalSigns_GuiMonSel);
 
-        /* Variables for Impulse Noise Removal */
-        static float dataCurr = 0;
-        static float dataPrev2 = 0;
-        static float dataPrev1 = 0;
+    /* Variables for Impulse Noise Removal */
+    static float dataCurr = 0;
+    static float dataPrev2 = 0;
+    static float dataPrev1 = 0;
 
-        /* Variables for Clutter Removal */
-        uint16_t guiFlag_ClutterRemoval  = pGuiMonSel->guiFlag_ClutterRemoval;
+    /* Variables for Clutter Removal */
+    uint16_t guiFlag_ClutterRemoval  = pGuiMonSel->guiFlag_ClutterRemoval;
 
-        /* Variables for Phase Unwrapping */
-        static float phasePrevFrame = 0;              // Phase value of Previous frame (For phase unwrapping)
-        static float diffPhaseCorrectionCum = 0;      // Phase correction cumulative (For phase unwrapping)
-        static float phaseUsedComputationPrev = 0;    // Phase values used for the Previous frame
-        static int8_t inverse = 0; //it gets high when the signal have a lot of distorsion
-        static float phaseUsedComputation = 0;               // Unwrapped Phase value used for computation
+    /* Variables for Phase Unwrapping */
+    static float phasePrevFrame[NUM_RANGEBINS_PROC] = {0};              // Phase value of Previous frame (For phase unwrapping)
+    static float diffPhaseCorrectionCum[NUM_RANGEBINS_PROC] = {0};      // Phase correction cumulative (For phase unwrapping)
+    static float phaseUsedComputationPrev[NUM_RANGEBINS_PROC] = {0};    // Phase values used for the Previous frame
+    static int8_t inverse[NUM_RANGEBINS_PROC] = {0}; //it gets high when the signal have a lot of distorsion
+    static float phaseUsedComputation[NUM_RANGEBINS_PROC] = {0};               // Unwrapped Phase value used for computation
 
-        /* Variables for Detecting Motion Corrupted Segments */
-        uint16_t guiFlag_MotionDetection = obj->cliCfg->motionDetectionParamsCfg.enabled;       // GUI Flag. Set from the configuration File
-        uint16_t guiFlag_GainControl     = obj->cliCfg->motionDetectionParamsCfg.gainControl;   // GUI Flag. Set from the configuration File
-        uint16_t indexMotionDetection;      // Temporary Index
-        float sumEnergy;                    // Energy in the data-segment checked for presence of large-scale motion
+    /* Variables for Detecting Motion Corrupted Segments */
+    uint16_t guiFlag_MotionDetection = obj->cliCfg->motionDetectionParamsCfg.enabled;       // GUI Flag. Set from the configuration File
+    uint16_t guiFlag_GainControl     = obj->cliCfg->motionDetectionParamsCfg.gainControl;   // GUI Flag. Set from the configuration File
+    uint16_t indexMotionDetection;      // Temporary Index
+    float sumEnergy;                    // Energy in the data-segment checked for presence of large-scale motion
 
-        /* Vital Signs Waveform */
-        float outputFilterBreathOut;              // Breathing waveform after the IIR-Filter
-        float outputFilterHeartOut;               // Cardiac waveform after the IIR-Filter
+    /* Vital Signs Waveform */
+    float outputFilterBreathOut, outputFilterBreathOutTracked=0;              // Breathing waveform after the IIR-Filter
+    float outputFilterHeartOut, outputFilterHeartOutTracked=0;               // Cardiac waveform after the IIR-Filter
+    float unrapPhasePeakTracked;
 
-        /* Variables for FFT-based Spectral Estimation */
-        uint16_t pPeakSortOutIndex[MAX_NUM_PEAKS_SPECTRUM];   // Sorted Peaks in the Spectrum
-        uint16_t numPeaks_BreathSpectrum;                     // Number of Peaks in the Breathing Spectrum
-        uint16_t numPeaks_heartSpectrum;                      // Number of Peaks in the Cardiac Spectrum
-        uint16_t maxIndexHeartBeatSpect, maxIndexBreathSpect; // Indices corresponding to the max peak in the Breathing and Cardiac Spectrum
-        uint16_t maxIndexHeartBeatSpect_4Hz;                  // Indices corresponding to the max peak from [1.6 - 4.0] Hz
-        float breathingRateEst_FFT, heartRateEst_FFT;         // Vital Signs Estimate based on the FFT
-        float heartRateEst_FFT_4Hz;                           // Vital Signs Estimate based on the FFT
+    /* Variables for FFT-based Spectral Estimation */
+    uint16_t pPeakSortOutIndex[MAX_NUM_PEAKS_SPECTRUM];   // Sorted Peaks in the Spectrum
+    uint16_t numPeaks_BreathSpectrum;                     // Number of Peaks in the Breathing Spectrum
+    uint16_t numPeaks_heartSpectrum;                      // Number of Peaks in the Cardiac Spectrum
+    uint16_t maxIndexHeartBeatSpect, maxIndexBreathSpect; // Indices corresponding to the max peak in the Breathing and Cardiac Spectrum
+    uint16_t maxIndexHeartBeatSpect_4Hz;                  // Indices corresponding to the max peak from [1.6 - 4.0] Hz
+    float breathingRateEst_FFT[NUM_RANGEBINS_PROC], heartRateEst_FFT[NUM_RANGEBINS_PROC], heartRateEst_FFT_max2[NUM_RANGEBINS_PROC];         // Vital Signs Estimate based on the FFT
+    float heartRateEst_FFT_4Hz[NUM_RANGEBINS_PROC];
+    static uint16_t plotSwitching = 0;// Vital Signs Estimate based on the FFT
 
-        /* Confidence Metric associated with the estimates */
-        float confidenceMetricBreath[MAX_NUM_PEAKS_SPECTRUM];         // Confidence Metric associated with each Breathing Spectrum Peak
-        float confidenceMetricHeart[MAX_NUM_PEAKS_SPECTRUM];          // Confidence Metric associated with each Cardiac Spectrum Peak
-        float confidenceMetricBreathOut, confidenceMetricHeartOut;    // Confidence Metric associated with the estimates
-        float confidenceMetricHeartOut_4Hz;                           // Confidence Metric for the 1st Heart beat Harmonic
-        float confidenceMetricHeartOut_xCorr;                         // Confidence Metric for the Autocorrelation
-        float confidenceMetricBreathOut_xCorr;                        // Confidence Metric for the Autocorrelation based breathing-rate estimate
-        float peakValueBreathSpect;
+    /* Confidence Metric associated with the estimates */
+    float confidenceMetricBreath[MAX_NUM_PEAKS_SPECTRUM];         // Confidence Metric associated with each Breathing Spectrum Peak
+    float confidenceMetricHeart[MAX_NUM_PEAKS_SPECTRUM];          // Confidence Metric associated with each Cardiac Spectrum Peak
+    float confidenceMetricBreathOut[NUM_RANGEBINS_PROC], confidenceMetricHeartOut[NUM_RANGEBINS_PROC], confidenceMetricHeartOut_max2[NUM_RANGEBINS_PROC];    // Confidence Metric associated with the estimates
+    float confidenceMetricHeartOut_4Hz[NUM_RANGEBINS_PROC];                           // Confidence Metric for the 1st Heart beat Harmonic
+    float confidenceMetricHeartOut_xCorr[NUM_RANGEBINS_PROC] = {};                         // Confidence Metric for the Autocorrelation
+    float confidenceMetricBreathOut_xCorr[NUM_RANGEBINS_PROC] = {};                        // Confidence Metric for the Autocorrelation based breathing-rate estimate
+    float peakValueBreathSpect;
 
-        /* Variables for peak-counting */
-        uint16_t pPeakLocsHeart[MAX_PEAKS_ALLOWED_WFM];    // Peak locations (indices) of the Cardiac Waveform
-        uint16_t pPeakLocsBreath[MAX_PEAKS_ALLOWED_WFM];   // Peak locations (indices) of the Breathing Waveform
-        uint16_t pPeakLocsValid[MAX_PEAKS_ALLOWED_WFM];    // Peak locations after only retaining the valid peaks
-        uint16_t numPeaksBreath, numPeaksHeart;                       // Number of peaks in the time-domain filtered waveform
-        float breathingRateEst_peakCount, heartRateEst_peakCount;     // Vital Signs Estimate based on peak-Interval
-        float heartRateEst_peakCount_filtered;                        // Heart-rate peak-interval based estimate after filtering
-        static int16_t lastPeak = -100;
-        int16_t period_frequente, period;
+    /* Variables for peak-counting */
+    uint16_t pPeakLocsHeart[MAX_PEAKS_ALLOWED_WFM];    // Peak locations (indices) of the Cardiac Waveform
+    uint16_t pPeakLocsBreath[MAX_PEAKS_ALLOWED_WFM];   // Peak locations (indices) of the Breathing Waveform
+    uint16_t pPeakLocsValid[MAX_PEAKS_ALLOWED_WFM];    // Peak locations after only retaining the valid peaks
+    uint16_t numPeaksBreath, numPeaksHeart;                       // Number of peaks in the time-domain filtered waveform
+    float breathingRateEst_peakCount[MAX_PEAKS_ALLOWED_WFM], heartRateEst_peakCount;     // Vital Signs Estimate based on peak-Interval
+    float heartRateEst_peakCount_filtered;                        // Heart-rate peak-interval based estimate after filtering
+    static int16_t lastPeak = -100;
+    int16_t SFR_period, JJ_period;
 
-        /* Exponential smoothing filter */
-        static float breathWfmOutUpdated, heartWfmOutUpdated;    // Updated values after exponential smoothing
-        float breathWfmOutPrev, heartWfmOutPrev;                 // Exponential smoothing values at time instance (t-1)
-        float sumEnergyBreathWfm, sumEnergyHeartWfm;             // These values are used to make a decision if the energy in the waveform is sufficient for it to be classfied as a valid waveform
+    /* Exponential smoothing filter */
+    static double breathWfmOutUpdated, heartWfmOutUpdated = 0;    // Updated values after exponential smoothing
+    double breathWfmOutPrev, heartWfmOutPrev;                 // Exponential smoothing values at time instance (t-1)
+    double sumEnergyBreathWfm, sumEnergyHeartWfm;             // These values are used to make a decision if the energy in the waveform is sufficient for it to be classfied as a valid waveform
 
-        /* Variables for Auto-Correlation */
-        float heartRateEst_xCorr;         // Heart-rate estimate from the Autocorrelation Method
-        float breathRateEst_xCorr;        // Breathing-rate estimate from the Autocorrelation Method
-        //uint16_t minLagcurrent,maxLagcurrent;
-        //static float HR_High_CM=78;
+    /* Variables for Auto-Correlation */
+    float heartRateEst_xCorr[NUM_RANGEBINS_PROC] = {};         // Heart-rate estimate from the Autocorrelation Method
+    float breathRateEst_xCorr[NUM_RANGEBINS_PROC] = {};        // Breathing-rate estimate from the Autocorrelation Method
 
-        /* For FIR Filtering */
-        static float pDataIn[FIR_FILTER_SIZE] = {[0 ... FIR_FILTER_SIZE-1] = 70};
+    /* For FIR Filtering */
+    static float pDataIn[FIR_FILTER_SIZE] = {[0 ... FIR_FILTER_SIZE-1] = 70};
 
-        /* Variables for Extracting the Range-FFT output  */
-        uint16_t rangeBinIndex;             // Range-bin Index
-        float rangeBinPhase;                // Phase of the Range-bin selected for processing
-        static uint16_t rangeBinIndexPhaseprev,rangeBinIndexFrequent=0;
-        static float rangeBinIndexPhase=20;
-        uint32_t penteRangeBin,minAmp;
-        //static float notfiltredrangeBinIndex=20; // Index of the Range Bin for which the phase is computed
-        //float alphaBin=0.02;
-        //static counter=0;
+    /* Variables for Extracting the Range-FFT output  */
+    uint16_t rangeBinIndex;             // Range-bin Index
+    float rangeBinPhase;                // Phase of the Range-bin selected for processing
+    static uint16_t rangeBinIndexPhase = 20, rangeBinIndexPhaseprev, rangeBinIndexFrequent=0;
+    uint32_t penteRangeBin,minAmp;
 
-        uint16_t rangeBinMax;               // Index of the Strongest Range-Bin
-        //static uint16_t changeRangeBin=10;
-        static uint8_t rangeBinBuffer[rangeBinBuffersize]={0}; // buffer fih el e5er 60 range bin max
-        static uint8_t rangeBinBufferhisto[45]={[0] = rangeBinBuffersize}; // histogramme lel buffer
+    uint16_t rangeBinMax;               // Index of the Strongest Range-Bin
+    static uint8_t rangeBinBuffer[RANGE_BIN_BUFFER_SIZE]={0}; // buffer fih el e5er 60 range bin max
+    static uint8_t rangeBinBufferhisto[MAX_TRUCK_INDEX]={[0] = RANGE_BIN_BUFFER_SIZE}; // histogramme lel buffer
 
-        uint16_t indexTemp, indexNumPeaks;  // Temporary Indices
-        int16_t temp_real, temp_imag;       // Temporary variables storing the Real and Imaginary part of a range-bin in the Range-FFT Output
-        float absVal;                       // Absolute value based on the Real and Imaginary values7
-        float maxVal;                       // Maximum Value of the Range-Bin in the current range-profile
+    uint16_t indexTemp, indexNumPeaks;  // Temporary Indices
+    int16_t temp_real, temp_imag;       // Temporary variables storing the Real and Imaginary part of a range-bin in the Range-FFT Output
+    float absVal;                       // Absolute value based on the Real and Imaginary values
+    float maxVal;                       // Maximum Value of the Range-Bin in the current range-profile
 
-        /*gui processing variables*/
-        static float heartRateBuffer[HEART_RATE_EST_MEDIAN_FLT_SIZE] = {[0 ... HEART_RATE_EST_MEDIAN_FLT_SIZE-1] = 70};
-        static float heartRateBufferSort[HEART_RATE_EST_MEDIAN_FLT_SIZE + 2] = {[0] = -1,[1 ... HEART_RATE_EST_MEDIAN_FLT_SIZE] = 70,[HEART_RATE_EST_MEDIAN_FLT_SIZE + 1] = 300};
+    /*gui processing variables*/
+    static float heartRateBuffer[HEART_RATE_EST_MEDIAN_FLT_SIZE] = {[0 ... HEART_RATE_EST_MEDIAN_FLT_SIZE-1] = 70};
+    static float heartRateBufferSort[HEART_RATE_EST_MEDIAN_FLT_SIZE + 2] = {[0] = -1,[1 ... HEART_RATE_EST_MEDIAN_FLT_SIZE] = 70,[HEART_RATE_EST_MEDIAN_FLT_SIZE + 1] = 300};
 
-        if (pGuiMonSel->guiFlag_Reset  == 1)   // Refresh Pushbutton on the GUI Pressed
-        {
-            //gFrameCount = 1;
-            pGuiMonSel->guiFlag_Reset = 0;
-            breathWfmOutUpdated = 0;
-            heartWfmOutUpdated = 0;
-        }
+    static int8_t guiFlag_Meanfft = 0;
+    int8_t breathHeld_Flag = 0;
+    static int8_t breathHeld_Count = 0,holdingBreath = 0;
+    static int test = 7;
+    float test1,test2 = 0.1,test3,test4,score;
+    if (pGuiMonSel->guiFlag_Reset  == 1)   // Refresh Pushbutton on the GUI Pressed
+    {
+        //gFrameCount = 1;
+        pGuiMonSel->guiFlag_Reset = 0;
+        breathWfmOutUpdated = 0;
+        heartWfmOutUpdated = 0;
+        /*guiFlag_Meanfft = 1 - guiFlag_Meanfft;
+         obj->rxAntennaProcess += 1;
+         bj->rxAntennaProcess = obj->rxAntennaProcess % 4;
+         if(obj->rxAntennaProcess == 0)obj->rxAntennaProcess+=1;*/
+    }
 
-       /* if(frameCountLocal == 1000)
-        {
-            frameCountLocal = 1;
-        }
-        else *//*if (RANGE_BIN_TRACKING)
-        {
-            frameCountLocal = gFrameCount % RESET_LOCAL_COUNT_VAL;
-        }
-        else
-        {
-            frameCountLocal = gFrameCount;
-        }*/
-        rangeBinMax = 0;
-        maxVal = -100000000;
-        int test=0;
+    rangeBinMax = 0;
+    maxVal = -100000000;
+    if (guiFlag_ClutterRemoval == 1)
+    {
+        minAmp = 770;
+        penteRangeBin = 150;// 85;
+    }
+    else
+    {
+        minAmp = 875000;//to be done
+        penteRangeBin = 100000;
+    }
+    // tempPtr points towards the RX-Channel to process
+    cmplx16ReIm_t *tempPtr;
+    if(guiFlag_Meanfft) tempPtr = obj->meanfft + (obj->rxAntennaProcess - 1)*obj->numRangeBins;
+    else tempPtr = obj->fftOut1D + obj->numRangeBins * obj->numRxAntennas + (obj->rxAntennaProcess - 1)*obj->numRangeBins;
+    // tempPtr points towards rangeBinStartIndex
+    tempPtr += (obj->rangeBinStartIndex) ;
+    for (rangeBinIndex = obj->rangeBinStartIndex; rangeBinIndex <= obj->rangeBinEndIndex; rangeBinIndex++)
+    {
+        // Points towards the real part of the current range-bin i.e. rangeBinIndex
+        temp_real = (int16_t) tempPtr->real;
+        obj->pRangeProfileCplx[rangeBinIndex - obj->rangeBinStartIndex].real = temp_real;
+
+        // Points towards the imaginary part of the current range-bin i.e. rangeBinIndex
+        temp_imag = (int16_t) tempPtr->imag;
+        obj->pRangeProfileCplx[rangeBinIndex - obj->rangeBinStartIndex].imag = temp_imag;
+
+        // Move the pointer towards the next range-bin
+        tempPtr ++;
+
         if (guiFlag_ClutterRemoval == 1)
         {
-            minAmp = 770;
-            penteRangeBin = 150;// 85;
+            // Clutter Removed Range Profile
+            float tempReal_Curr,tempImag_Curr;
+            float alphaClutter = 0.03;//0.01;
+
+            tempReal_Curr = (float) temp_real;
+            tempImag_Curr = (float) temp_imag;
+            uint16_t currRangeIndex;
+            currRangeIndex = rangeBinIndex - obj->rangeBinStartIndex;
+
+            obj->pTempReal_Prev[currRangeIndex]  = alphaClutter*tempReal_Curr + (1-alphaClutter)*obj->pTempReal_Prev[currRangeIndex];
+            obj->pTempImag_Prev[currRangeIndex]  = alphaClutter*tempImag_Curr + (1-alphaClutter)*obj->pTempImag_Prev[currRangeIndex];
+
+            absVal = sqrt((tempReal_Curr - obj->pTempReal_Prev[currRangeIndex])*(tempReal_Curr - obj->pTempReal_Prev[currRangeIndex]) + (tempImag_Curr - obj->pTempImag_Prev[currRangeIndex])*(tempImag_Curr - obj->pTempImag_Prev[currRangeIndex]));
+            obj->pRangeProfileClutterRemoved[rangeBinIndex - obj->rangeBinStartIndex] = absVal;
+
         }
         else
         {
-            minAmp = 875000;
-            penteRangeBin = 100000;
+            // Magnitude of the current range-bin
+            absVal = (float) temp_real * (float) temp_real + (float) temp_imag * (float) temp_imag;
         }
-        // tempPtr points towards the RX-Channel to process
-        cmplx16ReIm_t *tempPtr = obj->fftOut1D + (obj->rxAntennaProcess - 1)*obj->numRangeBins;
-        // tempPtr points towards rangeBinStartIndex
-        tempPtr += (obj->rangeBinStartIndex) ;
 
-        for (rangeBinIndex = obj->rangeBinStartIndex; rangeBinIndex <= obj->rangeBinEndIndex; rangeBinIndex++)
-          {
-            // Points towards the real part of the current range-bin i.e. rangeBinIndex
-            temp_real = (int16_t) tempPtr->real;
-            obj->pRangeProfileCplx[rangeBinIndex - obj->rangeBinStartIndex].real = temp_real;
+        // Maximum value range-bin of the current range-profile
+        if(obj->rangeBinStartIndex < rangeBinIndex && rangeBinIndex < obj->rangeBinEndIndex-1)
+        {
+            if(((float)(absVal-maxVal)/(float)(rangeBinIndex-rangeBinMax)) > penteRangeBin ||
+                    ((absVal > maxVal) && ((rangeBinIndex == rangeBinMax+1)||(maxVal<minAmp))))
+            {
+                maxVal = absVal;
+                rangeBinMax = rangeBinIndex;
+            }
+        }
 
-            // Points towards the imaginary part of the current range-bin i.e. rangeBinIndex
-            temp_imag = (int16_t) tempPtr->imag;
-            obj->pRangeProfileCplx[rangeBinIndex - obj->rangeBinStartIndex].imag = temp_imag;
+        rangeBinPhase = atan2(temp_imag, temp_real);
 
-            // Move the pointer towards the next range-bin
-            tempPtr ++;
+        //if (rangeBinIndex == rangeBinIndexPhase)//si -1 donc rangeBinMax mete5ouch el start 5ater el start-1 mahouch traiter
+        //{
+        obj->unwrapPhasePeak = unwrap(rangeBinPhase, phasePrevFrame[rangeBinIndex - obj->rangeBinStartIndex], &diffPhaseCorrectionCum[rangeBinIndex - obj->rangeBinStartIndex],0);//(rangeBinIndexPhase)!=rangeBinIndexPhaseprev);
+        phasePrevFrame[rangeBinIndex - obj->rangeBinStartIndex] = rangeBinPhase;
+        //rangeBinIndexPhaseprev = rangeBinIndexPhase;
+        if(FLAG_COMPUTE_PHASE_DIFFERENCE)
+        {
+           /* holdingBreath++;
+            if(holdingBreath > 70)
+                breathHeld_Flag = 1;*/
 
 
-         if (guiFlag_ClutterRemoval == 1)
-         {
-             // Clutter Removed Range Profile
-             float tempReal_Curr,tempImag_Curr;
-             float alphaClutter = 0.01;//0.01;
+            if(phaseUsedComputation[rangeBinIndex - obj->rangeBinStartIndex]*(obj->unwrapPhasePeak - phaseUsedComputationPrev[rangeBinIndex - obj->rangeBinStartIndex]) < 0)
+            {
+                inverse[rangeBinIndex - obj->rangeBinStartIndex] += 5;
 
-             tempReal_Curr = (float) temp_real;
-             tempImag_Curr = (float) temp_imag;
-             uint16_t currRangeIndex;
-             currRangeIndex = rangeBinIndex - obj->rangeBinStartIndex;
-
-             obj->pTempReal_Prev[currRangeIndex]  = alphaClutter*tempReal_Curr + (1-alphaClutter)*obj->pTempReal_Prev[currRangeIndex];
-             obj->pTempImag_Prev[currRangeIndex]  = alphaClutter*tempImag_Curr + (1-alphaClutter)*obj->pTempImag_Prev[currRangeIndex];
-
-             absVal = sqrt((tempReal_Curr - obj->pTempReal_Prev[currRangeIndex])*(tempReal_Curr - obj->pTempReal_Prev[currRangeIndex]) + (tempImag_Curr - obj->pTempImag_Prev[currRangeIndex])*(tempImag_Curr - obj->pTempImag_Prev[currRangeIndex]));
-             obj->pRangeProfileClutterRemoved[rangeBinIndex - obj->rangeBinStartIndex] = absVal;
-
-            // if(absVal>770)test=1;//1000 -> 1300
-         }
+               /* //holding breath test
+                breathHeld_Count = 0;*/
+            }
             else
-         { // Magnitude of the current range-bin
-           absVal = (float) temp_real * (float) temp_real + (float) temp_imag * (float) temp_imag;
+            {
+                inverse[rangeBinIndex - obj->rangeBinStartIndex] -= 2;
 
-           //if(absVal>875000)test=1;//700 000 -> 800
-         }
+                /*//holding breath test
+                breathHeld_Count++;
+                if(breathHeld_Count > 30)
+                    holdingBreath = 0;*/
+            }
 
-         // Maximum value range-bin of the current range-profile
-         if(((float)(absVal-maxVal)/(float)(rangeBinIndex-rangeBinMax)) > penteRangeBin ||
-                 ((absVal > maxVal) && ((rangeBinIndex == rangeBinMax+1)||(maxVal<minAmp))))
-         {
-            // test=((float)(absVal-maxVal)/(float)(rangeBinIndex-rangeBinMax));
-                 maxVal = absVal;
-                 rangeBinMax = rangeBinIndex;
+            phaseUsedComputation[rangeBinIndex - obj->rangeBinStartIndex] = obj->unwrapPhasePeak - phaseUsedComputationPrev[rangeBinIndex - obj->rangeBinStartIndex];
+            phaseUsedComputationPrev[rangeBinIndex - obj->rangeBinStartIndex] = obj->unwrapPhasePeak;
+        }
+        else
+        {
+            phaseUsedComputation[rangeBinIndex - obj->rangeBinStartIndex] = obj->unwrapPhasePeak;
+        }
+        // Removes impulse like noise from the waveforms
+        if (FLAG_REMOVE_IMPULSE_NOISE)
+        {
+            dataPrev2 = dataPrev1;
+            dataPrev1 = dataCurr;
+            dataCurr = phaseUsedComputation[rangeBinIndex - obj->rangeBinStartIndex];
+            phaseUsedComputation[rangeBinIndex - obj->rangeBinStartIndex] = filter_RemoveImpulseNoise(dataPrev2, dataPrev1, dataCurr, obj->noiseImpulse_Thresh);
+        }
 
-         }
-           if (rangeBinIndex == (int)rangeBinIndexPhase)
-              {
-                   rangeBinPhase = atan2(temp_imag, temp_real);
-              }
-          } // For Loop ends
+        // IIR Filtering
+        outputFilterBreathOut = filter_IIR_BiquadCascade(phaseUsedComputation[rangeBinIndex - obj->rangeBinStartIndex], obj->pFilterCoefsBreath, obj->pScaleValsBreath, obj->pDelayBreath[rangeBinIndex - obj->rangeBinStartIndex], IIR_FILTER_BREATH_NUM_STAGES);
+        outputFilterHeartOut  = filter_IIR_BiquadCascade(phaseUsedComputation[rangeBinIndex - obj->rangeBinStartIndex], obj->pFilterCoefsHeart_4Hz, obj->pScaleValsHeart_4Hz, obj->pDelayHeart[rangeBinIndex - obj->rangeBinStartIndex], IIR_FILTER_HEART_NUM_STAGES);
 
-        // Phase-Unwrapping traja3 fel phase zeyda + n*2pi eli tmathel el distance paraport el distance initiale
-        // tetraki fel phase variation
-        obj->unwrapPhasePeak = unwrap(rangeBinPhase, phasePrevFrame, &diffPhaseCorrectionCum,((int)rangeBinIndexPhase)!=rangeBinIndexPhaseprev);
-        phasePrevFrame = rangeBinPhase;
-        rangeBinIndexPhaseprev = (int)rangeBinIndexPhase;
+        //outputFilterHeartOut = phaseUsedComputation[rangeBinIndex - obj->rangeBinStartIndex];
+        //outputFilterHeartOut= outputFilterBreathOut;
+        // Copies the "Breathing Waveform" in a circular Buffer
+        for (loopIndexBuffer = 1; loopIndexBuffer < obj->circularBufferSizeBreath; loopIndexBuffer++)
+        {
+            obj->pVitalSigns_Breath_CircularBuffer[(rangeBinIndex - obj->rangeBinStartIndex)*obj->circularBufferSizeBreath + loopIndexBuffer - 1] = obj->pVitalSigns_Breath_CircularBuffer[(rangeBinIndex - obj->rangeBinStartIndex)*obj->circularBufferSizeBreath + loopIndexBuffer];
+        }
+        obj->pVitalSigns_Breath_CircularBuffer[(rangeBinIndex - obj->rangeBinStartIndex)*obj->circularBufferSizeBreath + obj->circularBufferSizeBreath - 1] = outputFilterBreathOut;
+
+        // Detection of Motion corrupted Segments
+        if (guiFlag_MotionDetection == 1)
+        {
+            // Update the Motion Removal Circular Buffer
+            for (loopIndexBuffer = 1; loopIndexBuffer < obj->motionDetection_BlockSize; loopIndexBuffer++)
+                // Detection of Motion corrupted Segments
+            {
+                obj->pMotionCircularBuffer[loopIndexBuffer - 1] = obj->pMotionCircularBuffer[loopIndexBuffer];
+            }
+            obj->pMotionCircularBuffer[obj->motionDetection_BlockSize-1] = outputFilterHeartOut;
+            indexMotionDetection = gFrameCount % obj->motionDetection_BlockSize;
+
+            // Only perform these steps for every obj->motionDetection_BlockSize sample
+            if (indexMotionDetection == 0)
+            {
+                // Check if the current segment is "Noisy"
+                sumEnergy = 0;
+                for (loopIndexBuffer = 0; loopIndexBuffer < obj->motionDetection_BlockSize; loopIndexBuffer++)
+                {
+                    sumEnergy +=  (obj->pMotionCircularBuffer[loopIndexBuffer]*obj->pMotionCircularBuffer[loopIndexBuffer]);
+                }
+
+                if (sumEnergy > obj->motionDetection_Thresh)
+                {
+                    obj->motionDetected = 1;   // Temporary variable to send to the GUI
+                }
+                else
+                {
+                    obj->motionDetected = 0;   // Temporary variable to send to the GUI
+                }
+
+                // If NO motion detected in the current segment
+                if ( obj->motionDetected == 0)
+                {
+                    uint16_t tempEndIndex;
+                    //  Shift the current contents of the circular Buffer
+                    for (loopIndexBuffer = obj->motionDetection_BlockSize; loopIndexBuffer < obj->circularBufferSizeHeart; loopIndexBuffer++)
+                    {
+                        obj->pVitalSigns_Heart_CircularBuffer[loopIndexBuffer - obj->motionDetection_BlockSize] = obj->pVitalSigns_Heart_CircularBuffer[loopIndexBuffer];
+                    }
+                    // Copy the current data segment to the end of the Circular Buffer
+                    for (loopIndexBuffer = 0; loopIndexBuffer < obj->motionDetection_BlockSize; loopIndexBuffer++)
+                    {
+                        tempEndIndex = obj->circularBufferSizeHeart - obj->motionDetection_BlockSize;
+                        obj->pVitalSigns_Heart_CircularBuffer[ tempEndIndex + loopIndexBuffer] = obj->pMotionCircularBuffer[loopIndexBuffer];
+                    }
+                }
+            }
+        }
+        // If Motion DETECTED then don't UPDATE or SHIFT the values in the buffer
+        else // Regular processing
+        {
+            // Copies the "Cardiac Waveform" in a circular Buffer
+            for (loopIndexBuffer = 1; loopIndexBuffer < obj->circularBufferSizeHeart; loopIndexBuffer++)
+            {
+                obj->pVitalSigns_Heart_CircularBuffer[(rangeBinIndex - obj->rangeBinStartIndex)*obj->circularBufferSizeHeart + loopIndexBuffer - 1] = obj->pVitalSigns_Heart_CircularBuffer[(rangeBinIndex - obj->rangeBinStartIndex)*obj->circularBufferSizeHeart + loopIndexBuffer];
+            }
+            obj->pVitalSigns_Heart_CircularBuffer[(rangeBinIndex - obj->rangeBinStartIndex)*obj->circularBufferSizeHeart + obj->circularBufferSizeHeart - 1] = outputFilterHeartOut;
+        }
+        if(rangeBinIndex == rangeBinIndexPhase){
+            outputFilterBreathOutTracked = outputFilterBreathOut;
+            outputFilterHeartOutTracked = outputFilterHeartOut;
+            unrapPhasePeakTracked = obj->unwrapPhasePeak;
+
+            //holding breath event test
+            if(fabs(outputFilterBreathOutTracked) < 0.065)
+            {
+                breathHeld_Count++;
+                if(breathHeld_Count > 65)
+                {
+                    breathHeld_Flag = 1;
+                    breathHeld_Count = 66;
+                }
+            }
+            else
+                breathHeld_Count = 0;
+
+            /*//holding breath event test
+            if(fabs(phaseUsedComputation[rangeBinIndex - obj->rangeBinStartIndex]) < 0.2)
+            {
+                breathHeld_Count++;
+                if(breathHeld_Count > 70)
+                    breathHeld_Flag = 1;
+            }
+            else
+            {
+                breathHeld_Count -= 10;
+                if(breathHeld_Count < 0)
+                    breathHeld_Count = 0;
+            }*/
+        }
+        //}
+        } // For Loop ends
+
+    // Computes the phase differences between successive phase samples
+
+    if(inverse[rangeBinIndex - obj->rangeBinStartIndex] < 0) inverse[rangeBinIndex - obj->rangeBinStartIndex] = 0;
+    if(inverse[rangeBinIndex - obj->rangeBinStartIndex] > 80) //if we reached the limit of distorsion we update the range bin
+    {
+        inverse[rangeBinIndex - obj->rangeBinStartIndex] = 0;
+        for(loopIndexBuffer = 0 ; loopIndexBuffer < MAX_TRUCK_INDEX ; ++loopIndexBuffer)
+            rangeBinBufferhisto[loopIndexBuffer] = 0;
+        rangeBinBufferhisto[rangeBinMax] = RANGE_BIN_BUFFER_SIZE;
+        for(loopIndexBuffer = 0 ; loopIndexBuffer < RANGE_BIN_BUFFER_SIZE ; ++loopIndexBuffer)
+            rangeBinBuffer[loopIndexBuffer] = rangeBinMax;
+        rangeBinIndexPhase = rangeBinMax;
+        //notfiltredrangeBinIndex = rangeBinMax;
+        rangeBinIndexFrequent = rangeBinMax;
+    }
 
 #ifdef TEST_TONE  // Generates a Test-Tone
 
@@ -2811,451 +2969,424 @@ void MmwDemo_interFrameProcessing(MmwDemo_DSS_DataPathObj *obj)
 #endif
 
 
-        // most frequent range bin preparing
-        if(rangeBinMax <45){
-        uint8_t replacementIndex = gFrameCount%rangeBinBuffersize;
+    // frequency algorithm
+    if(rangeBinMax < MAX_TRUCK_INDEX)
+    {
+        uint8_t replacementIndex = gFrameCount%RANGE_BIN_BUFFER_SIZE;
         rangeBinBufferhisto[rangeBinBuffer[replacementIndex]]--; // ina9so 1 leli bich yetna7a w nzido 1 lel jdid
         rangeBinBufferhisto[rangeBinMax]++;
         rangeBinBuffer[replacementIndex] = rangeBinMax;
-        if(rangeBinBufferhisto[rangeBinIndexFrequent] < rangeBinBufferhisto[rangeBinMax]){
-            if((rangeBinIndexPhase < rangeBinMax) && (rangeBinIndexPhase < rangeBinIndexFrequent)){
+        if(rangeBinBufferhisto[rangeBinIndexFrequent] < rangeBinBufferhisto[rangeBinMax])
+        {
+            rangeBinIndexPhase = rangeBinMax;
+            /*
+            if((rangeBinIndexPhase < rangeBinMax) && (rangeBinIndexPhase < rangeBinIndexFrequent))
+            {
                 rangeBinIndexPhase = rangeBinMax;
                 if(rangeBinIndexFrequent < rangeBinMax)
                     rangeBinIndexPhase = rangeBinIndexFrequent;
                 //rangeBinIndexPhase += 0.2;
-                inverse = 0;
+                //inverse = 0;
             }
-            if((rangeBinIndexPhase > rangeBinMax) && (rangeBinIndexPhase > rangeBinIndexFrequent)){
+            if((rangeBinIndexPhase > rangeBinMax) && (rangeBinIndexPhase > rangeBinIndexFrequent))
+            {
                 rangeBinIndexPhase = rangeBinMax;
                 if(rangeBinIndexFrequent > rangeBinMax)
                     rangeBinIndexPhase = rangeBinIndexFrequent;
                 //rangeBinIndexPhase -= 0.2;
-                inverse = 0;
-            }
+                //inverse = 0;
+            }*/
             rangeBinIndexFrequent  = rangeBinMax;
         }
-        }
+    }
 
-        /*/average filter to the range bin changes
-        if(abs(rangeBinIndexFrequent-notfiltredrangeBinIndex) < 4){
-            if(rangeBinIndexFrequent > notfiltredrangeBinIndex) ++counter;
-            else if(rangeBinIndexFrequent < notfiltredrangeBinIndex) --counter;
-            alphaBin = abs(counter);
-            notfiltredrangeBinIndex = alphaBin * rangeBinIndexFrequent + (1 - alphaBin) * notfiltredrangeBinIndex;
-            rangeBinIndexPhase = (int) notfiltredrangeBinIndex;
-        }*/
+    /*/average filter to the range bin changes
+    static float notfiltredrangeBinIndex=20;
+    float alphaBin=0.02;
+    static counter=0;
+    if(abs(rangeBinIndexFrequent-notfiltredrangeBinIndex) < 4)
+    {
+        if(rangeBinIndexFrequent > notfiltredrangeBinIndex) ++counter;
+        else if(rangeBinIndexFrequent < notfiltredrangeBinIndex) --counter;
+        alphaBin = abs(counter);
+        notfiltredrangeBinIndex = alphaBin * rangeBinIndexFrequent + (1 - alphaBin) * notfiltredrangeBinIndex;
+        rangeBinIndexPhase = (int) notfiltredrangeBinIndex;
+    }*/
 
-        /*/el moyenne
-        int16_t s=0;
-        int8_t i;
-        for( i = 0;i < rangeBinBuffersize;i++){
-            s+=rangeBinBuffer[i];
-        }
-        rangeBinIndexPhase = s/rangeBinBuffersize;*/
+    /*/el moyenne
+    int16_t s=0;
+    int8_t i;
+    for( i = 0;i < RANGE_BIN_BUFFER_SIZE;i++){
+        s+=rangeBinBuffer[i];
+    }
+    rangeBinIndexPhase = s/RANGE_BIN_BUFFER_SIZE;*/
 
-        // Computes the phase differences between successive phase samples
-        if(FLAG_COMPUTE_PHASE_DIFFERENCE)
-          {
-            if(phaseUsedComputation*(obj->unwrapPhasePeak - phaseUsedComputationPrev) < 0)
-            {
-                inverse+=5;
-            }
-            else inverse-=2;
+    /* Spectral Estimation and JJ singal extraction based on the Shape form recognition method */
+    if(PERFORM_Heart_SFR)
+    {
+        numPeaksHeart  = shape_form_recognition(obj->pVitalSigns_Heart_CircularBuffer, pPeakLocsHeart,obj->pPeakValues, 0, obj->circularBufferSizeHeart  - 1,
+                                                obj->peakDistanceHeart_Min, obj->peakDistanceHeart_Max);
 
-            if( inverse < 0) inverse = 0;
-
-            if(inverse > 80) //if we reached the limit of distorsion we update the range bin
-            {
-                inverse = 0;
-                int8_t i;
-                for(i=0;i<45;++i)rangeBinBufferhisto[i]=0;
-                rangeBinBufferhisto[rangeBinMax]=rangeBinBuffersize;
-                for(i=0;i<rangeBinBuffersize;++i)rangeBinBuffer[i]=rangeBinMax;
-                rangeBinIndexPhase = rangeBinMax;
-                //notfiltredrangeBinIndex = rangeBinMax;
-                rangeBinIndexFrequent = rangeBinMax;
-            }
-            phaseUsedComputation = obj->unwrapPhasePeak - phaseUsedComputationPrev;
-            phaseUsedComputationPrev = obj->unwrapPhasePeak;
-          }
-        else
-          {
-            phaseUsedComputation = obj->unwrapPhasePeak;
-          }
-
-        // Removes impulse like noise from the waveforms
-        if (FLAG_REMOVE_IMPULSE_NOISE)
-        {
-            dataPrev2 = dataPrev1;
-            dataPrev1 = dataCurr;
-            dataCurr = phaseUsedComputation;
-            phaseUsedComputation = filter_RemoveImpulseNoise(dataPrev2, dataPrev1, dataCurr, obj->noiseImpulse_Thresh);
-        }
-
-        // IIR Filtering
-        outputFilterBreathOut = filter_IIR_BiquadCascade(phaseUsedComputation, obj->pFilterCoefsBreath, obj->pScaleValsBreath, obj->pDelayBreath, IIR_FILTER_BREATH_NUM_STAGES);
-        outputFilterHeartOut  = filter_IIR_BiquadCascade(phaseUsedComputation, obj->pFilterCoefsHeart_4Hz, obj->pScaleValsHeart_4Hz, obj->pDelayHeart, IIR_FILTER_HEART_NUM_STAGES);
-
-        // Copies the "Breathing Waveform" in a circular Buffer
-        for (loopIndexBuffer = 1; loopIndexBuffer < obj->circularBufferSizeBreath; loopIndexBuffer++)
-            {
-              obj->pVitalSigns_Breath_CircularBuffer[loopIndexBuffer - 1] = obj->pVitalSigns_Breath_CircularBuffer[loopIndexBuffer];
-            }
-        obj->pVitalSigns_Breath_CircularBuffer[obj->circularBufferSizeBreath - 1] = outputFilterBreathOut;
-     if (guiFlag_MotionDetection == 1)
-          {
-       // Update the Motion Removal Circular Buffer
-           for (loopIndexBuffer = 1; loopIndexBuffer < obj->motionDetection_BlockSize; loopIndexBuffer++)
-
-       // Detection of Motion corrupted Segments
-             {
-                  obj->pMotionCircularBuffer[loopIndexBuffer - 1] = obj->pMotionCircularBuffer[loopIndexBuffer] ;
-                }
-            obj->pMotionCircularBuffer[obj->motionDetection_BlockSize-1] = outputFilterHeartOut;
-            indexMotionDetection = gFrameCount % obj->motionDetection_BlockSize;
-
-            // Only perform these steps for every obj->motionDetection_BlockSize sample
-            if (indexMotionDetection == 0)
-            {
-       // Check if the current segment is "Noisy"
-                sumEnergy = 0;
-                for (loopIndexBuffer = 0; loopIndexBuffer < obj->motionDetection_BlockSize; loopIndexBuffer++)
-                {
-                    sumEnergy +=  (obj->pMotionCircularBuffer[loopIndexBuffer]*obj->pMotionCircularBuffer[loopIndexBuffer]);
-                }
-
-                if (sumEnergy > obj->motionDetection_Thresh)
-                   {
-                     obj->motionDetected = 1;   // Temporary variable to send to the GUI
-                   }
-                else
-                   {
-                     obj->motionDetected = 0;   // Temporary variable to send to the GUI
-                   }
-
-        // If NO motion detected in the current segment
-                if ( obj->motionDetected == 0)
-                {
-                    uint16_t tempEndIndex;
-        //  Shift the current contents of the circular Buffer
-                    for (loopIndexBuffer = obj->motionDetection_BlockSize; loopIndexBuffer < obj->circularBufferSizeHeart; loopIndexBuffer++)
-                        {
-                        obj->pVitalSigns_Heart_CircularBuffer[loopIndexBuffer - obj->motionDetection_BlockSize] = obj->pVitalSigns_Heart_CircularBuffer[loopIndexBuffer] ;
-                        }
-        // Copy the current data segment to the end of the Circular Buffer
-                    for (loopIndexBuffer = 0; loopIndexBuffer < obj->motionDetection_BlockSize; loopIndexBuffer++)
-                        {
-                        tempEndIndex = obj->circularBufferSizeHeart - obj->motionDetection_BlockSize;
-                        obj->pVitalSigns_Heart_CircularBuffer[ tempEndIndex + loopIndexBuffer] = obj->pMotionCircularBuffer[loopIndexBuffer] ;
-                        }
-                }
-            }
-          }
-        // If Motion DETECTED then don't UPDATE or SHIFT the values in the buffer
-        else // Regular processing
-           {
-        // Copies the "Cardiac Waveform" in a circular Buffer
-        for (loopIndexBuffer = 1; loopIndexBuffer < obj->circularBufferSizeHeart; loopIndexBuffer++)
-            {
-               obj->pVitalSigns_Heart_CircularBuffer[loopIndexBuffer - 1] = obj->pVitalSigns_Heart_CircularBuffer[loopIndexBuffer];
-            }
-               obj->pVitalSigns_Heart_CircularBuffer[obj->circularBufferSizeHeart - 1] = outputFilterHeartOut;
+        /*lastPeak -= obj->motionDetection_BlockSize;
+         if(numPeaksHeart >= 2 && pPeakLocsHeart[numPeaksHeart-1] != lastPeak)
+         {
+         JJ_period = pPeakLocsHeart[numPeaksHeart-1] - pPeakLocsHeart[numPeaksHeart-2];
+         lastPeak = pPeakLocsHeart[numPeaksHeart-1];
+         //prelastPeak = pPeakLocsHeart[numPeaksHeart-2];
          }
-
-        /* Spectral Estimation based on the Inter-Peaks Distance */
-        numPeaksHeart  = shape_form_recognition(obj->pVitalSigns_Heart_CircularBuffer, pPeakLocsHeart,obj->pPeakValues, 0, obj->circularBufferSizeHeart  - 1, obj->peakDistanceHeart_Min, obj->peakDistanceHeart_Max);
-        period_frequente  =  find_periodicity(pPeakLocsHeart, numPeaksHeart,obj->peakDistanceHeart_Min, obj->peakDistanceHeart_Max);
-        heartRateEst_peakCount = (float) CONVERT_HZ_BPM *((float) (1.0)/(period_frequente/obj->samplingFreq_Hz));
-
-        lastPeak -=1;
+         else
+         {
+            JJ_period = -2;
+         }  */
+        lastPeak -= 1;
         if(numPeaksHeart)
         {
             if(pPeakLocsHeart[numPeaksHeart-1] > lastPeak+2) //+2 cause gain control may make translation in the position of the heart peak so the +2 avoid detecting the same heart peak.
             {
-                period = pPeakLocsHeart[numPeaksHeart-1] - lastPeak;
+                JJ_period = pPeakLocsHeart[numPeaksHeart-1] - lastPeak;
                 lastPeak = pPeakLocsHeart[numPeaksHeart-1];
             }
             else if(pPeakLocsHeart[numPeaksHeart-1] == lastPeak)
             {
-                period = -1;
+                JJ_period = -1;
             }
             else
             {
-                period = -3;
+                JJ_period = -3;
             }
         }
         else
         {
-            period = -2;
+            JJ_period = -2;
         }
+    }
 
-        for (loopIndexBuffer = 1; loopIndexBuffer < FIR_FILTER_SIZE; loopIndexBuffer++)
+    float heartRateEst_HarmonicEnergy;
+    float breathRateEst_HarmonicEnergy;
+    static int16_t heartRate_out = 0;
+    float BreathingRate_Out;
+    static float maxRCS_updated;
+    static int8_t TheFirstFrame=1;
+    float heartRateEstDisplay, heartRateEstDisplay1, heartRateEstDisplay2, heartRateEstDisplay3;
+    static float xk = 0, xb = 17;
+    float heartRate_OutMedian;
+    maxRCS_updated = ALPHA_RCS*maxVal + (1-ALPHA_RCS)*maxRCS_updated;
+
+    if(gFrameCount % obj->motionDetection_BlockSize == 0)
+    {
+        uint32_t blockCount = gFrameCount / obj->motionDetection_BlockSize;
+
+        /* Spectral Estimation based on the Inter-Peaks Distance */
+        if(PERFORM_Heart_SFR)
+        {
+            SFR_period  =  find_periodicity(pPeakLocsHeart, numPeaksHeart,obj->peakDistanceHeart_Min, obj->peakDistanceHeart_Max);
+            heartRateEst_peakCount = (float) CONVERT_HZ_BPM *((float) (1.0)/(SFR_period/obj->samplingFreq_Hz));
+
+            for (loopIndexBuffer = 1; loopIndexBuffer < FIR_FILTER_SIZE; loopIndexBuffer++)
             {
                 pDataIn[loopIndexBuffer - 1] = pDataIn[loopIndexBuffer];
             }
             pDataIn[FIR_FILTER_SIZE - 1] = heartRateEst_peakCount;
             heartRateEst_peakCount_filtered = filter_FIR(pDataIn, obj->pFilterCoefs, FIR_FILTER_SIZE);
-
-        numPeaksBreath = find_Peaks(obj->pVitalSigns_Breath_CircularBuffer, int32_type, pPeakLocsBreath, obj->pPeakValues, 0, obj->circularBufferSizeBreath - 1);
-        if (numPeaksBreath != 0)
-        {
-            numPeaksBreath  = filterPeaksWfm(pPeakLocsBreath, obj->pPeakValues,pPeakLocsValid, numPeaksBreath, obj->peakDistanceBreath_Min, obj->peakDistanceBreath_Max);
         }
 
-        breathingRateEst_peakCount = CONVERT_HZ_BPM  * ((numPeaksBreath * obj->samplingFreq_Hz) / obj->circularBufferSizeBreath);
-       // heartRateEst_peakCount     = CONVERT_HZ_BPM  * ((numPeaksHeart * obj->samplingFreq_Hz) /  obj->circularBufferSizeHeart);
-
-        // Input to the FFT needs to be complex
-        memset((uint8_t *)obj->pVitalSignsBuffer_Cplx, 0, obj->breathingWfm_Spectrum_FftSize * sizeof(cmplx32ReIm_t));
-        for (loopIndexBuffer = 0; loopIndexBuffer < obj->circularBufferSizeBreath; loopIndexBuffer++)
+        for (rangeBinIndex = obj->rangeBinStartIndex; rangeBinIndex <= obj->rangeBinEndIndex; rangeBinIndex++)
+        {
+            if(PERFORM_Breath_PK)
             {
-                obj->pVitalSignsBuffer_Cplx[loopIndexBuffer].real = (int32_t) obj->scale_breathingWfm*obj->pVitalSigns_Breath_CircularBuffer[loopIndexBuffer];
-                obj->pVitalSignsBuffer_Cplx[loopIndexBuffer].imag=0;
+                numPeaksBreath = find_Peaks(obj->pVitalSigns_Breath_CircularBuffer + (rangeBinIndex - obj->rangeBinStartIndex)*obj->circularBufferSizeBreath,
+                                            int32_type, pPeakLocsBreath, obj->pPeakValues, 0, obj->circularBufferSizeBreath - 1);
+                if (numPeaksBreath != 0)
+                {
+                    numPeaksBreath  = filterPeaksWfm(pPeakLocsBreath, obj->pPeakValues,pPeakLocsValid, numPeaksBreath, obj->peakDistanceBreath_Min, obj->peakDistanceBreath_Max);
+                }
+                breathingRateEst_peakCount[rangeBinIndex - obj->rangeBinStartIndex] = CONVERT_HZ_BPM  * ((numPeaksBreath * obj->samplingFreq_Hz) / obj->circularBufferSizeBreath);
+            }
+            if(PERFORM_Breath_FFT || PERFORM_Heart_FFT_2hz || PERFORM_Heart_FFT_4hz)
+            {
+                memset((uint8_t *)obj->pVitalSignsBuffer_Cplx, 0, obj->breathingWfm_Spectrum_FftSize * sizeof(cmplx32ReIm_t));
             }
 
-        // Input is overwritten by the DSP_fft32x32 function
-        DSP_fft32x32(
-                    (int32_t *)obj->pVitalSignsSpectrumTwiddle32x32,
-                    obj->breathingWfm_Spectrum_FftSize,
-                    (int32_t *) obj->pVitalSignsBuffer_Cplx,
-                    (int32_t *) obj->pVitalSigns_SpectrumCplx);
-
-        MmwDemo_magnitudeSquared(
-                       obj->pVitalSigns_SpectrumCplx,
-                       obj->pVitalSigns_Breath_AbsSpectrum,
-                       obj->breathingWfm_Spectrum_FftSize);
-
-        memset((uint8_t *)obj->pVitalSignsBuffer_Cplx, 0, obj->heartWfm_Spectrum_FftSize * sizeof(cmplx32ReIm_t));
-
-        // Pre-Processing Steps for the Cardiac Waveform
-        // Perform Automatic Gain Control if enabled from the GUI // 3al blocks eli fihom motiondetection
-       if (guiFlag_GainControl == 1)
-       {
-        computeAGC ( obj->pVitalSigns_Heart_CircularBuffer, obj->circularBufferSizeHeart, obj->motionDetection_BlockSize, obj->motionDetection_Thresh);
-       }
-
-       if (guiFlag_MotionDetection == 1)
-       {
-         outputFilterHeartOut =  obj->pMotionCircularBuffer[obj->motionDetection_BlockSize-1];
-       }
-       else
-       {
-         outputFilterHeartOut = obj->pVitalSigns_Heart_CircularBuffer[obj->circularBufferSizeHeart-1];
-       }
-
-       // Perform Autocorrelation on the Waveform
-       if (PERFORM_XCORR)
-       {
-           float temp;
-           // Perform Autocorrelation on the Cardiac-Waveform
-           uint16_t xCorr_numPeaks;
-           uint16_t maxIndex_lag;
-           /*minLagcurrent = obj->samplingFreq_Hz / ((HR_High_CM-6)/CONVERT_HZ_BPM);
-           maxLagcurrent = obj->samplingFreq_Hz / ((HR_High_CM+6)/CONVERT_HZ_BPM);
-           if(minLagcurrent < obj->xCorr_minLag)
-               minLagcurrent = obj->xCorr_minLag;
-           if(maxLagcurrent > obj->xCorr_maxLag)
-               maxLagcurrent = obj->xCorr_maxLag;*/
-           computeAutoCorrelation ( obj->pVitalSigns_Heart_CircularBuffer,  obj->circularBufferSizeHeart , obj->pXcorr, obj->xCorr_minLag, obj->xCorr_maxLag);
-           xCorr_numPeaks  = find_Peaks(obj->pXcorr, float_type, obj->pPeakIndex, obj->pPeakValues, obj->xCorr_minLag, obj->xCorr_maxLag);
-           maxIndex_lag    = computeMaxIndex((float*) obj->pXcorr, obj->xCorr_minLag, obj->xCorr_maxLag);
-           heartRateEst_xCorr = (float) CONVERT_HZ_BPM *((float) (1.0)/(maxIndex_lag/obj->samplingFreq_Hz));
-
-           if (xCorr_numPeaks == 0 )
-           {
-               confidenceMetricHeartOut_xCorr = 0;
-           }
-           else
-           {
-               confidenceMetricHeartOut_xCorr = obj->pXcorr[maxIndex_lag];
-           }
-
-          // Auto-correlation on the Breathing Waveform
-          computeAutoCorrelation ( obj->pVitalSigns_Breath_CircularBuffer,  obj->circularBufferSizeBreath,
-                                   obj->pXcorr, obj->xCorr_Breath_minLag, obj->xCorr_Breath_maxLag);
-          xCorr_numPeaks  = find_Peaks(obj->pXcorr, float_type, obj->pPeakIndex, obj->pPeakValues, obj->xCorr_Breath_minLag, obj->xCorr_Breath_maxLag);
-          maxIndex_lag    = computeMaxIndex((float*) obj->pXcorr, obj->xCorr_Breath_minLag, obj->xCorr_Breath_maxLag);
-          temp = (float) (1.0)/(maxIndex_lag/obj->samplingFreq_Hz);
-          breathRateEst_xCorr = (float) CONVERT_HZ_BPM *temp;
-
-          if (xCorr_numPeaks == 0 )
-          {
-              confidenceMetricBreathOut_xCorr = 0;
-          }
-          else
-          {
-              confidenceMetricBreathOut_xCorr = obj->pXcorr[maxIndex_lag];
-          }
-       }
-
-        // Apply Window on the Cardiac Waveform prior to FFT-based spectral estimation
-        // and copies the Pre-processed data to pCircularBufferHeart
-        if (FLAG_APPLY_WINDOW)
-        {
-            uint16_t index_win;
-            uint16_t index_WinEnd;
-
-            float tempFloat;
-            index_WinEnd =  obj->circularBufferSizeHeart - 1;
-            for (index_win = 0; index_win < DOPPLER_WINDOW_SIZE; index_win++)
+            if(PERFORM_Breath_FFT)
             {
-              tempFloat = obj->pDopplerWindow[index_win];
-              obj->pVitalSignsBuffer_Cplx[index_win].real    = (int32_t) obj->scale_heartWfm * tempFloat * obj->pVitalSigns_Heart_CircularBuffer[index_win];
-              obj->pVitalSignsBuffer_Cplx[index_WinEnd].real = (int32_t) obj->scale_heartWfm * tempFloat * obj->pVitalSigns_Heart_CircularBuffer[index_WinEnd];
-              obj->pVitalSignsBuffer_Cplx[index_win].imag    = 0;
-              obj->pVitalSignsBuffer_Cplx[index_WinEnd].imag = 0;
-              index_WinEnd --;
+                // Input to the FFT needs to be complex
+                for (loopIndexBuffer = 0; loopIndexBuffer < obj->circularBufferSizeBreath; loopIndexBuffer++)
+                {
+                    obj->pVitalSignsBuffer_Cplx[loopIndexBuffer].real = (int32_t) obj->scale_breathingWfm*
+                            obj->pVitalSigns_Breath_CircularBuffer[(rangeBinIndex - obj->rangeBinStartIndex)*obj->circularBufferSizeBreath + loopIndexBuffer];
+                    obj->pVitalSignsBuffer_Cplx[loopIndexBuffer].imag=0;
+                }
+                // Input is overwritten by the DSP_fft32x32 function
+                DSP_fft32x32(
+                        (int32_t *)obj->pVitalSignsSpectrumTwiddle32x32,
+                        obj->breathingWfm_Spectrum_FftSize,
+                        (int32_t *) obj->pVitalSignsBuffer_Cplx,
+                        (int32_t *) obj->pVitalSigns_SpectrumCplx);
+
+                MmwDemo_magnitudeSquared(
+                        obj->pVitalSigns_SpectrumCplx,
+                        obj->pVitalSigns_Breath_AbsSpectrum,
+                        obj->breathingWfm_Spectrum_FftSize);
+
+                memset((uint8_t *)obj->pVitalSignsBuffer_Cplx, 0, obj->heartWfm_Spectrum_FftSize * sizeof(cmplx32ReIm_t));
             }
-            for (loopIndexBuffer = DOPPLER_WINDOW_SIZE; loopIndexBuffer < obj->circularBufferSizeHeart - DOPPLER_WINDOW_SIZE ; loopIndexBuffer++)
+
+            // Pre-Processing Steps for the Cardiac Waveform
+            // Perform Automatic Gain Control if enabled from the GUI // 3al blocks eli fihom motiondetection
+            if (guiFlag_GainControl == 1)
             {
-              obj->pVitalSignsBuffer_Cplx[loopIndexBuffer].real = (int32_t)  (obj->scale_heartWfm)*obj->pVitalSigns_Heart_CircularBuffer[loopIndexBuffer];
-              obj->pVitalSignsBuffer_Cplx[loopIndexBuffer].imag = 0;
+                computeAGC ( obj->pVitalSigns_Heart_CircularBuffer + (rangeBinIndex - obj->rangeBinStartIndex)*obj->circularBufferSizeHeart,
+                             obj->circularBufferSizeHeart, obj->motionDetection_BlockSize, obj->motionDetection_Thresh);
             }
-        }
-        else
-        {
-           for (loopIndexBuffer = 0; loopIndexBuffer < obj->circularBufferSizeHeart; loopIndexBuffer++)
-               {
-                obj->pVitalSignsBuffer_Cplx[loopIndexBuffer].real = (int32_t) (obj->scale_heartWfm)*obj->pVitalSigns_Heart_CircularBuffer[loopIndexBuffer];
-                obj->pVitalSignsBuffer_Cplx[loopIndexBuffer].imag=0;
-               }
-        }
 
-        // FFT of the Cardiac Waveform
-        DSP_fft32x32(
-                    (int32_t *)obj->pVitalSignsSpectrumTwiddle32x32,
-                    obj->heartWfm_Spectrum_FftSize,
-                    (int32_t *) obj->pVitalSignsBuffer_Cplx,
-                    (int32_t *) obj->pVitalSigns_SpectrumCplx);
-
-        MmwDemo_magnitudeSquared(
-                       obj->pVitalSigns_SpectrumCplx,
-                       obj->pVitalSigns_Heart_AbsSpectrum,
-                       obj->heartWfm_Spectrum_FftSize);
-
-        // Pick the Peaks in the Breathing Spectrum
-        numPeaks_BreathSpectrum = find_Peaks(obj->pVitalSigns_Breath_AbsSpectrum, float_type, obj->pPeakIndex, obj->pPeakValues,
-                                             obj->breath_startFreq_Index, obj->breath_endFreq_Index);
-        indexNumPeaks = (numPeaks_BreathSpectrum < MAX_NUM_PEAKS_SPECTRUM) ? numPeaks_BreathSpectrum : MAX_NUM_PEAKS_SPECTRUM;
-
-        if (indexNumPeaks != 0)
-           {
-           heapsort_index(obj->pPeakValues, numPeaks_BreathSpectrum, obj->pPeakIndexSorted);
-           for(indexTemp = 0; indexTemp < indexNumPeaks; indexTemp++ )
-              {
-              pPeakSortOutIndex[indexTemp] = obj->pPeakIndex [obj->pPeakIndexSorted[numPeaks_BreathSpectrum-indexTemp-1] ];
-              confidenceMetricBreath[indexTemp]  = computeConfidenceMetric(obj->pVitalSigns_Breath_AbsSpectrum,
-                                                                           obj->confMetric_spectrumBreath_IndexStart,
-                                                                           obj->confMetric_spectrumBreath_IndexEnd,
-                                                                           pPeakSortOutIndex[indexTemp],
-                                                                           obj->confMetric_numIndexAroundPeak_breath);
-              }
-           maxIndexBreathSpect       = pPeakSortOutIndex[0]; // The maximum peak
-           confidenceMetricBreathOut = confidenceMetricBreath[0];
-           }
-           else
-        {
-           maxIndexBreathSpect    = computeMaxIndex((float*) obj->pVitalSigns_Breath_AbsSpectrum, obj->breath_startFreq_Index, obj->breath_endFreq_Index);
-           confidenceMetricBreathOut  = computeConfidenceMetric(obj->pVitalSigns_Breath_AbsSpectrum,
-                                                                0,
-                                                                PHASE_FFT_SIZE/4,
-                                                                maxIndexBreathSpect,
-                                                                obj->confMetric_numIndexAroundPeak_breath);
-        }
-        peakValueBreathSpect = obj->pVitalSigns_Breath_AbsSpectrum[maxIndexBreathSpect]/(10*obj->scale_breathingWfm);
-
-       // Pick the Peaks in the Heart Spectrum [1.6 - 4.0 Hz]
-       numPeaks_heartSpectrum = find_Peaks(obj->pVitalSigns_Heart_AbsSpectrum, uint32_type, obj->pPeakIndex, obj->pPeakValues,
-                                           obj->heart_startFreq_Index_1p6Hz, obj->heart_endFreq_Index_4Hz);
-       indexNumPeaks = (numPeaks_heartSpectrum < MAX_NUM_PEAKS_SPECTRUM) ? numPeaks_heartSpectrum : MAX_NUM_PEAKS_SPECTRUM;
-       if (indexNumPeaks != 0)
+            // Perform Autocorrelation on the Cardiac-Waveform
+            if (PERFORM_Heart_XCORR)
             {
-            heapsort_index(obj->pPeakValues, numPeaks_heartSpectrum, obj->pPeakIndexSorted);
-            for(indexTemp = 0; indexTemp < indexNumPeaks; indexTemp++ )
-               {
-                pPeakSortOutIndex[indexTemp] = obj->pPeakIndex [obj->pPeakIndexSorted[numPeaks_heartSpectrum-indexTemp-1] ];
-               }
-       maxIndexHeartBeatSpect_4Hz    = pPeakSortOutIndex[0]; // The maximum peak
-       confidenceMetricHeartOut_4Hz  = computeConfidenceMetric(obj->pVitalSigns_Heart_AbsSpectrum,
-                                                               obj->confMetric_spectrumHeart_IndexStart_1p6Hz,
-                                                               obj->confMetric_spectrumHeart_IndexStart_4Hz,
-                                                               maxIndexHeartBeatSpect_4Hz,
-                                                               obj->confMetric_numIndexAroundPeak_heart);
-           }
-       else
-           {
-              maxIndexHeartBeatSpect_4Hz = computeMaxIndex((float*) obj->pVitalSigns_Heart_AbsSpectrum, obj->heart_startFreq_Index_1p6Hz, obj->heart_endFreq_Index_4Hz);
-              confidenceMetricHeartOut_4Hz = computeConfidenceMetric(obj->pVitalSigns_Heart_AbsSpectrum,
-                                                                     0,
-                                                                     PHASE_FFT_SIZE/4,
-                                                                     maxIndexHeartBeatSpect_4Hz,
-                                                                     obj->confMetric_numIndexAroundPeak_heart);
-           }
-          heartRateEst_FFT_4Hz  = (float) CONVERT_HZ_BPM * maxIndexHeartBeatSpect_4Hz * (obj->freqIncrement_Hz);
+                uint16_t xCorr_numPeaks;
+                uint16_t maxIndex_lag;
 
-          // If a peak is within [1.6 2.0] Hz then check if a harmonic is present in the cardiac spectrum region [0.8 - 2.0] Hz
-          if (heartRateEst_FFT_4Hz < MAX_HEART_RATE_BPM)
-          {
-             for (indexTemp =1; indexTemp<numPeaks_heartSpectrum;indexTemp++)
+                computeAutoCorrelation ( obj->pVitalSigns_Heart_CircularBuffer + (rangeBinIndex - obj->rangeBinStartIndex)*obj->circularBufferSizeHeart,
+                                         obj->circularBufferSizeHeart , obj->pXcorr, obj->xCorr_minLag, obj->xCorr_maxLag);
+                xCorr_numPeaks  = find_Peaks(obj->pXcorr, float_type, obj->pPeakIndex, obj->pPeakValues, obj->xCorr_minLag, obj->xCorr_maxLag);
+                maxIndex_lag    = computeMaxIndex((float*) obj->pXcorr, obj->xCorr_minLag, obj->xCorr_maxLag);
+                heartRateEst_xCorr[rangeBinIndex - obj->rangeBinStartIndex] = CONVERT_HZ_BPM * obj->samplingFreq_Hz / maxIndex_lag;
 
-                 if(abs(heartRateEst_FFT_4Hz - CONVERT_HZ_BPM *(obj->freqIncrement_Hz)*pPeakSortOutIndex[indexTemp]) < HEART_HAMRONIC_THRESH_BPM)
-                 {
-                     heartRateEst_FFT_4Hz = CONVERT_HZ_BPM *(obj->freqIncrement_Hz)*pPeakSortOutIndex[indexTemp];
-                     break;
-                 }
-          }
-
-        // Pick the Peaks in the Cardiac Spectrum
-        numPeaks_heartSpectrum = find_Peaks(obj->pVitalSigns_Heart_AbsSpectrum, float_type, obj->pPeakIndex, obj->pPeakValues, obj->heart_startFreq_Index, obj->heart_endFreq_Index);
-        indexNumPeaks = (numPeaks_heartSpectrum < MAX_NUM_PEAKS_SPECTRUM) ? numPeaks_heartSpectrum : MAX_NUM_PEAKS_SPECTRUM;
-
-        if (indexNumPeaks != 0)
-        {
-        heapsort_index(obj->pPeakValues, numPeaks_heartSpectrum, obj->pPeakIndexSorted);
-        for(indexTemp = 0; indexTemp < indexNumPeaks; indexTemp++ )
-                  {
-                   pPeakSortOutIndex[indexTemp] = obj->pPeakIndex [obj->pPeakIndexSorted[numPeaks_heartSpectrum-indexTemp-1] ];
-                   confidenceMetricHeart[indexTemp]  = computeConfidenceMetric(obj->pVitalSigns_Heart_AbsSpectrum,
-                                                                                          obj->confMetric_spectrumHeart_IndexStart,
-                                                                                          obj->confMetric_spectrumHeart_IndexEnd,
-                                                                                          pPeakSortOutIndex[indexTemp],
-                                                                                          obj->confMetric_numIndexAroundPeak_heart);
-                  }
-            maxIndexHeartBeatSpect   = pPeakSortOutIndex[0]; // The maximum peak
-            confidenceMetricHeartOut = confidenceMetricHeart[0];
-        }
-        else
-        {
-         maxIndexHeartBeatSpect    = computeMaxIndex((float*) obj->pVitalSigns_Heart_AbsSpectrum, obj->heart_startFreq_Index, obj->heart_endFreq_Index);
-         confidenceMetricHeartOut  = computeConfidenceMetric(obj->pVitalSigns_Heart_AbsSpectrum,
-                                                                        0,
-                                                                        PHASE_FFT_SIZE/4,
-                                                                        maxIndexHeartBeatSpect,
-                                                                        obj->confMetric_numIndexAroundPeak_heart);
-        }
-
-        // Remove the First Breathing Harmonic (if present in the cardiac Spectrum)
-        if(FLAG_HARMONIC_CANCELLATION)
-        {
-            float diffIndex = abs(maxIndexHeartBeatSpect - BREATHING_HARMONIC_NUM*maxIndexBreathSpect);
-            if ( diffIndex*(obj->freqIncrement_Hz)*CONVERT_HZ_BPM < BREATHING_HAMRONIC_THRESH_BPM ) // Only cancel the 2nd Breathing Harmonic
-            {
-                maxIndexHeartBeatSpect = pPeakSortOutIndex[1]; // Pick the 2nd Largest peak in the cardiac-spectrum
-                confidenceMetricHeartOut = confidenceMetricHeart[1];
+                if (xCorr_numPeaks == 0 )
+                {
+                    confidenceMetricHeartOut_xCorr[rangeBinIndex - obj->rangeBinStartIndex] = 0;
+                }
+                else
+                {
+                    confidenceMetricHeartOut_xCorr[rangeBinIndex - obj->rangeBinStartIndex] = obj->pXcorr[maxIndex_lag];
+                }
             }
-        }
 
-       heartRateEst_FFT     = (float) CONVERT_HZ_BPM * maxIndexHeartBeatSpect * (obj->freqIncrement_Hz);
-       breathingRateEst_FFT = (float) CONVERT_HZ_BPM * maxIndexBreathSpect  * (obj->freqIncrement_Hz);
+            // Auto-correlation on the Breathing Waveform
+            if (PERFORM_Breath_XCORR)
+            {
+                uint16_t xCorr_numPeaks;
+                uint16_t maxIndex_lag;
+
+                computeAutoCorrelation ( obj->pVitalSigns_Breath_CircularBuffer+ (rangeBinIndex - obj->rangeBinStartIndex)*obj->circularBufferSizeBreath,
+                                         obj->circularBufferSizeBreath, obj->pXcorr, obj->xCorr_Breath_minLag, obj->xCorr_Breath_maxLag);
+                xCorr_numPeaks  = find_Peaks(obj->pXcorr, float_type, obj->pPeakIndex, obj->pPeakValues, obj->xCorr_Breath_minLag, obj->xCorr_Breath_maxLag);
+                maxIndex_lag    = computeMaxIndex((float*) obj->pXcorr, obj->xCorr_Breath_minLag, obj->xCorr_Breath_maxLag);
+                breathRateEst_xCorr[rangeBinIndex - obj->rangeBinStartIndex] = CONVERT_HZ_BPM * obj->samplingFreq_Hz / maxIndex_lag;
+
+                if (xCorr_numPeaks == 0 )
+                {
+                    confidenceMetricBreathOut_xCorr[rangeBinIndex - obj->rangeBinStartIndex] = 0;
+                }
+                else
+                {
+                    confidenceMetricBreathOut_xCorr[rangeBinIndex - obj->rangeBinStartIndex] = obj->pXcorr[maxIndex_lag];
+                }
+            }
+            if(PERFORM_Heart_FFT_2hz || PERFORM_Heart_FFT_4hz)
+            {
+                // Apply Window on the Cardiac Waveform prior to FFT-based spectral estimation
+                // and copies the Pre-processed data to pCircularBufferHeart
+                if (FLAG_APPLY_WINDOW)
+                {
+                    uint16_t index_win;
+                    uint16_t index_WinEnd;
+
+                    float tempFloat;
+                    index_WinEnd =  obj->circularBufferSizeHeart - 1;
+                    for (index_win = 0; index_win < DOPPLER_WINDOW_SIZE; index_win++)
+                    {
+                        tempFloat = obj->pDopplerWindow[index_win];
+                        obj->pVitalSignsBuffer_Cplx[index_win].real    = (int32_t) obj->scale_heartWfm * tempFloat * obj->pVitalSigns_Heart_CircularBuffer[(rangeBinIndex - obj->rangeBinStartIndex)*obj->circularBufferSizeHeart + index_win];
+                        obj->pVitalSignsBuffer_Cplx[index_WinEnd].real = (int32_t) obj->scale_heartWfm * tempFloat * obj->pVitalSigns_Heart_CircularBuffer[(rangeBinIndex - obj->rangeBinStartIndex)*obj->circularBufferSizeHeart + index_WinEnd];
+                        obj->pVitalSignsBuffer_Cplx[index_win].imag    = 0;
+                        obj->pVitalSignsBuffer_Cplx[index_WinEnd].imag = 0;
+                        index_WinEnd --;
+                    }
+                    for (loopIndexBuffer = DOPPLER_WINDOW_SIZE; loopIndexBuffer < obj->circularBufferSizeHeart - DOPPLER_WINDOW_SIZE ; loopIndexBuffer++)
+                    {
+                        obj->pVitalSignsBuffer_Cplx[loopIndexBuffer].real = (int32_t)  (obj->scale_heartWfm)*obj->pVitalSigns_Heart_CircularBuffer[(rangeBinIndex - obj->rangeBinStartIndex)*obj->circularBufferSizeHeart + loopIndexBuffer];
+                        obj->pVitalSignsBuffer_Cplx[loopIndexBuffer].imag = 0;
+                    }
+                }
+                else
+                {
+                    for (loopIndexBuffer = 0; loopIndexBuffer < obj->circularBufferSizeHeart; loopIndexBuffer++)
+                    {
+                        obj->pVitalSignsBuffer_Cplx[loopIndexBuffer].real = (int32_t) (obj->scale_heartWfm)*obj->pVitalSigns_Heart_CircularBuffer[(rangeBinIndex - obj->rangeBinStartIndex)*obj->circularBufferSizeHeart + loopIndexBuffer];
+                        obj->pVitalSignsBuffer_Cplx[loopIndexBuffer].imag=0;
+                    }
+                }
+
+                // FFT of the Cardiac Waveform
+                DSP_fft32x32(
+                        (int32_t *)obj->pVitalSignsSpectrumTwiddle32x32,
+                        obj->heartWfm_Spectrum_FftSize,
+                        (int32_t *) obj->pVitalSignsBuffer_Cplx,
+                        (int32_t *) obj->pVitalSigns_SpectrumCplx);
+
+                MmwDemo_magnitudeSquared(
+                        obj->pVitalSigns_SpectrumCplx,
+                        obj->pAbsSpectrum,
+                        obj->heartWfm_Spectrum_FftSize);
+
+                if(rangeBinIndex == rangeBinIndexPhase+plotSwitching-1)
+                {
+                    memcpy(obj->pVitalSigns_Heart_AbsSpectrum,obj->pAbsSpectrum,obj->heartWfm_Spectrum_FftSize * sizeof(float));
+                }
+            }
+
+            if(PERFORM_Breath_FFT)
+            {
+                // Pick the Peaks in the Breathing Spectrum
+                numPeaks_BreathSpectrum = find_Peaks(obj->pVitalSigns_Breath_AbsSpectrum, float_type, obj->pPeakIndex, obj->pPeakValues,
+                                                     obj->breath_startFreq_Index, obj->breath_endFreq_Index);
+                indexNumPeaks = (numPeaks_BreathSpectrum < MAX_NUM_PEAKS_SPECTRUM) ? numPeaks_BreathSpectrum : MAX_NUM_PEAKS_SPECTRUM;
+
+                if (indexNumPeaks != 0)
+                {
+                    heapsort_index(obj->pPeakValues, numPeaks_BreathSpectrum, obj->pPeakIndexSorted);
+                    for(indexTemp = 0; indexTemp < indexNumPeaks; indexTemp++ )
+                    {
+                        pPeakSortOutIndex[indexTemp] = obj->pPeakIndex [obj->pPeakIndexSorted[numPeaks_BreathSpectrum-indexTemp-1] ];
+                        confidenceMetricBreath[indexTemp]  = 1;/*computeConfidenceMetric(obj->pVitalSigns_Breath_AbsSpectrum,
+                                                                                     obj->confMetric_spectrumBreath_IndexStart,
+                                                                                     obj->confMetric_spectrumBreath_IndexEnd,
+                                                                                     pPeakSortOutIndex[indexTemp],
+                                                                                     obj->confMetric_numIndexAroundPeak_breath,
+                                                                                     0);*/
+                    }
+                    maxIndexBreathSpect       = pPeakSortOutIndex[0]; // The maximum peak
+                    confidenceMetricBreathOut[rangeBinIndex - obj->rangeBinStartIndex] = confidenceMetricBreath[0];
+                }
+                else
+                {
+                    maxIndexBreathSpect    = computeMaxIndex((float*) obj->pVitalSigns_Breath_AbsSpectrum, obj->breath_startFreq_Index, obj->breath_endFreq_Index);
+                    confidenceMetricBreathOut[rangeBinIndex - obj->rangeBinStartIndex]  = 1;/*computeConfidenceMetric(obj->pVitalSigns_Breath_AbsSpectrum,
+                                                                                                                  0,
+                                                                                                                  PHASE_FFT_SIZE/4,
+                                                                                                                  maxIndexBreathSpect,
+                                                                                                                  obj->confMetric_numIndexAroundPeak_breath,
+                                                                                                                  0);*/
+                }
+
+                peakValueBreathSpect = obj->pVitalSigns_Breath_AbsSpectrum[maxIndexBreathSpect]/(10*obj->scale_breathingWfm);
+            }
+
+            if(PERFORM_Heart_FFT_4hz)
+            {
+                // Pick the Peaks in the Heart Spectrum [1.6 - 4.0 Hz]
+                numPeaks_heartSpectrum = find_Peaks(obj->pAbsSpectrum, uint32_type, obj->pPeakIndex, obj->pPeakValues,
+                                                    obj->heart_startFreq_Index_1p6Hz, ceil(3.2/obj->freqIncrement_Hz));//obj->heart_endFreq_Index_4Hz);
+                indexNumPeaks = (numPeaks_heartSpectrum < MAX_NUM_PEAKS_SPECTRUM) ? numPeaks_heartSpectrum : MAX_NUM_PEAKS_SPECTRUM;
+                if (indexNumPeaks != 0)
+                {
+                    heapsort_index(obj->pPeakValues, numPeaks_heartSpectrum, obj->pPeakIndexSorted);
+                    for(indexTemp = 0; indexTemp < indexNumPeaks; indexTemp++ )
+                    {
+                        pPeakSortOutIndex[indexTemp] = obj->pPeakIndex [obj->pPeakIndexSorted[numPeaks_heartSpectrum-indexTemp-1] ];
+                    }
+                    maxIndexHeartBeatSpect_4Hz   = pPeakSortOutIndex[0]; // The maximum peak
+                    confidenceMetricHeartOut_4Hz[rangeBinIndex - obj->rangeBinStartIndex]  = computeConfidenceMetric_harmonicCondidate(obj->pAbsSpectrum,
+                                                                                                                                       obj->confMetric_spectrumHeart_IndexStart_1p6Hz,
+                                                                                                                                       obj->confMetric_spectrumHeart_IndexStart_4Hz,
+                                                                                                                                       maxIndexHeartBeatSpect_4Hz,
+                                                                                                                                       obj->confMetric_numIndexAroundPeak_heart,
+                                                                                                                                       maxIndexBreathSpect);
+                }
+                else
+                {
+                    maxIndexHeartBeatSpect_4Hz = computeMaxIndex((float*) obj->pAbsSpectrum, obj->heart_startFreq_Index_1p6Hz, obj->heart_endFreq_Index_4Hz);
+                    confidenceMetricHeartOut_4Hz[rangeBinIndex - obj->rangeBinStartIndex] = computeConfidenceMetric_harmonicCondidate(obj->pAbsSpectrum,
+                                                                                                                                      0,
+                                                                                                                                      PHASE_FFT_SIZE/4,
+                                                                                                                                      maxIndexHeartBeatSpect_4Hz,
+                                                                                                                                      obj->confMetric_numIndexAroundPeak_heart,
+                                                                                                                                      maxIndexBreathSpect);
+                }
+                heartRateEst_FFT_4Hz[rangeBinIndex - obj->rangeBinStartIndex]  = (float) CONVERT_HZ_BPM * maxIndexHeartBeatSpect_4Hz * (obj->freqIncrement_Hz);
+
+                // If a peak is within [1.6 2.0] Hz then check if a harmonic is present is the cardiac spectrum region [0.8 - 2.0] Hz
+                /*if (heartRateEst_FFT_4Hz[rangeBinIndex - obj->rangeBinStartIndex] < MAX_HEART_RATE_BPM)
+                {
+                    for (indexTemp =1; indexTemp<numPeaks_heartSpectrum;indexTemp++)
+
+                        if(fabs(heartRateEst_FFT_4Hz[rangeBinIndex - obj->rangeBinStartIndex] - CONVERT_HZ_BPM *(obj->freqIncrement_Hz)*pPeakSortOutIndex[indexTemp]) < HEART_HAMRONIC_THRESH_BPM)
+                        {
+                            heartRateEst_FFT_4Hz[rangeBinIndex - obj->rangeBinStartIndex] = CONVERT_HZ_BPM *(obj->freqIncrement_Hz)*pPeakSortOutIndex[indexTemp];
+                            break;
+                        }
+                }*/
+            }
+
+            if(PERFORM_Heart_FFT_2hz)
+            {
+                // Pick the Peaks in the Cardiac Spectrum
+                numPeaks_heartSpectrum = find_Peaks(obj->pAbsSpectrum, float_type, obj->pPeakIndex,
+                                                    obj->pPeakValues, obj->heart_startFreq_Index, ceil(1.6/obj->freqIncrement_Hz));//obj->heart_endFreq_Index);
+                indexNumPeaks = (numPeaks_heartSpectrum < MAX_NUM_PEAKS_SPECTRUM) ? numPeaks_heartSpectrum : MAX_NUM_PEAKS_SPECTRUM;
+                if (indexNumPeaks != 0)
+                {
+                    heapsort_index(obj->pPeakValues, numPeaks_heartSpectrum, obj->pPeakIndexSorted);
+                    for(indexTemp = 0; indexTemp < indexNumPeaks; indexTemp++ )
+                    {
+                        pPeakSortOutIndex[indexTemp] = obj->pPeakIndex [obj->pPeakIndexSorted[numPeaks_heartSpectrum-indexTemp-1]];
+                        confidenceMetricHeart[indexTemp]  = computeConfidenceMetric_fondamentalCondidate(obj->pAbsSpectrum,
+                                                                                                         obj->confMetric_spectrumHeart_IndexStart,
+                                                                                                         obj->confMetric_spectrumHeart_IndexEnd,
+                                                                                                         pPeakSortOutIndex[indexTemp],
+                                                                                                         obj->confMetric_numIndexAroundPeak_heart,
+                                                                                                         maxIndexBreathSpect);
+                    }
+                    maxIndexHeartBeatSpect  = pPeakSortOutIndex[0]; // The maximum peak
+                    confidenceMetricHeartOut[rangeBinIndex - obj->rangeBinStartIndex] = confidenceMetricHeart[0];
+                }
+                else
+                {
+                    maxIndexHeartBeatSpect  = computeMaxIndex((float*) obj->pAbsSpectrum, obj->heart_startFreq_Index, obj->heart_endFreq_Index);
+                    confidenceMetricHeartOut[rangeBinIndex - obj->rangeBinStartIndex] = computeConfidenceMetric_fondamentalCondidate(obj->pAbsSpectrum,
+                                                                                                                                     0,
+                                                                                                                                     PHASE_FFT_SIZE/4,
+                                                                                                                                     maxIndexHeartBeatSpect,
+                                                                                                                                     obj->confMetric_numIndexAroundPeak_heart,
+                                                                                                                                     maxIndexBreathSpect);
+                }
+
+                // Remove the First Breathing Harmonic (if present in the cardiac Spectrum)
+                if(FLAG_HARMONIC_CANCELLATION && indexNumPeaks > 1 && PERFORM_Breath_FFT)
+                {
+                    float diffIndex = fabs(maxIndexHeartBeatSpect - BREATHING_HARMONIC_NUM*maxIndexBreathSpect);
+                    if ( diffIndex*(obj->freqIncrement_Hz)*CONVERT_HZ_BPM < BREATHING_HAMRONIC_THRESH_BPM ) // Only cancel the 2nd Breathing Harmonic
+                    {
+                        maxIndexHeartBeatSpect = pPeakSortOutIndex[1]; // Pick the 2nd Largest peak in the cardiac-spectrum
+                        confidenceMetricHeartOut[rangeBinIndex - obj->rangeBinStartIndex] = confidenceMetricHeart[1];
+                    }
+                }
+
+                if( indexNumPeaks > 1)
+                {
+                    heartRateEst_FFT_max2[rangeBinIndex - obj->rangeBinStartIndex]     = (float) CONVERT_HZ_BPM * pPeakSortOutIndex[1] * (obj->freqIncrement_Hz);
+                    confidenceMetricHeartOut_max2[rangeBinIndex - obj->rangeBinStartIndex] = confidenceMetricHeart[1];
+                }
+                else
+                {
+                    heartRateEst_FFT_max2[rangeBinIndex - obj->rangeBinStartIndex]     = 0;
+                    confidenceMetricHeartOut_max2[rangeBinIndex - obj->rangeBinStartIndex] = 0;
+                }
+                heartRateEst_FFT[rangeBinIndex - obj->rangeBinStartIndex]     = (float) CONVERT_HZ_BPM * maxIndexHeartBeatSpect * (obj->freqIncrement_Hz);
+            }
+            if(PERFORM_Breath_FFT)
+                breathingRateEst_FFT[rangeBinIndex - obj->rangeBinStartIndex] = (float) CONVERT_HZ_BPM * maxIndexBreathSpect  * (obj->freqIncrement_Hz);
+        }
+        ++plotSwitching;
+        plotSwitching %= 4;
+
 
 #ifdef HARMONICS_ENERGY
-       float heartRateEst_HarmonicEnergy;
-       float breathRateEst_HarmonicEnergy;
        uint16_t maxIndexHeartBeatSpect_temp;
        uint16_t maxIndexBreathSpect_temp;
 
        memset((void *)obj->pDataOutTemp, 0, obj->heartWfm_Spectrum_FftSize*sizeof(float));
-       computeEnergyHarmonics (obj->pVitalSigns_Heart_AbsSpectrum,
+       computeEnergyHarmonics (obj->pAbsSpectrum,
                                obj->pDataOutTemp,
                                obj->confMetric_spectrumHeart_IndexStart,
                                obj->confMetric_spectrumHeart_IndexEnd,
@@ -3279,197 +3410,198 @@ void MmwDemo_interFrameProcessing(MmwDemo_DSS_DataPathObj *obj)
 
 #endif
 
-      //  Median Value for Heart Rate and Breathing Rate based on 'MEDIAN_WINDOW_LENGTH' previous estimates
-       if(FLAG_MEDIAN_FILTER)
+        //  Median Value for Heart Rate and Breathing Rate based on 'MEDIAN_WINDOW_LENGTH' previous estimates
+        if(FLAG_MEDIAN_FILTER)
+        {
+            for (loopIndexBuffer = 1; loopIndexBuffer < MEDIAN_WINDOW_LENGTH; loopIndexBuffer++)
+            {
+                obj->pBufferHeartRate[loopIndexBuffer - 1]     = obj->pBufferHeartRate[loopIndexBuffer];
+                obj->pBufferBreathingRate[loopIndexBuffer - 1] = obj->pBufferBreathingRate[loopIndexBuffer];
+                obj->pBufferHeartRate_4Hz[loopIndexBuffer - 1]     = obj->pBufferHeartRate_4Hz[loopIndexBuffer];
+            }
+            obj->pBufferHeartRate[MEDIAN_WINDOW_LENGTH - 1]     = heartRateEst_FFT[0];
+            obj->pBufferBreathingRate[MEDIAN_WINDOW_LENGTH - 1] = breathingRateEst_FFT[0];
+            obj->pBufferHeartRate_4Hz[MEDIAN_WINDOW_LENGTH - 1] = heartRateEst_FFT_4Hz[0];
+
+            heapsort_index(obj->pBufferHeartRate, MEDIAN_WINDOW_LENGTH,  obj->pPeakSortTempIndex);
+            heartRateEst_FFT[0] = obj->pBufferHeartRate[ obj->pPeakSortTempIndex[MEDIAN_WINDOW_LENGTH/2+1]];
+
+            heapsort_index(obj->pBufferHeartRate_4Hz, MEDIAN_WINDOW_LENGTH,  obj->pPeakSortTempIndex);
+            heartRateEst_FFT_4Hz[0] = obj->pBufferHeartRate_4Hz[ obj->pPeakSortTempIndex[MEDIAN_WINDOW_LENGTH/2+1]];
+
+            heapsort_index(obj->pBufferBreathingRate, MEDIAN_WINDOW_LENGTH,  obj->pPeakSortTempIndex);
+            breathingRateEst_FFT[0] = obj->pBufferBreathingRate[ obj->pPeakSortTempIndex[MEDIAN_WINDOW_LENGTH/2+1]];
+        }
+
+        /*if (guiFlag_MotionDetection == 1)
+        {
+            outputFilterHeartOutTracked =  obj->pMotionCircularBuffer[obj->motionDetection_BlockSize-1];
+        }
+        else
+        {
+            outputFilterHeartOutTracked = obj->pVitalSigns_Heart_CircularBuffer[(rangeBinIndexPhase - obj->rangeBinStartIndex)*obj->circularBufferSizeHeart + obj->circularBufferSizeHeart - 1];
+            //el valeur initiale mta3 el rangeBinIndexPhase tnajem tkoun mehech mawjoda donc ta3ti nan lel hwf
+        }*/
+
+        // Exponential Smoothing
+        /*breathWfmOutPrev = breathWfmOutUpdated;
+        breathWfmOutUpdated = (obj->alpha_breathing )*(outputFilterBreathOutTracked*outputFilterBreathOutTracked) + (1 - obj->alpha_breathing)*breathWfmOutPrev; // Exponential Smoothing
+        sumEnergyBreathWfm = breathWfmOutUpdated*10000;*/
+
+        heartWfmOutPrev = heartWfmOutUpdated;
+        heartWfmOutUpdated = (obj->alpha_heart )*(outputFilterHeartOutTracked*outputFilterHeartOutTracked) + (1 - obj->alpha_heart)*heartWfmOutPrev;  // Exponential Smoothing
+        sumEnergyHeartWfm = heartWfmOutUpdated*10000;
+
+        for (rangeBinIndex = obj->rangeBinStartIndex; rangeBinIndex <= obj->rangeBinEndIndex; rangeBinIndex++)
+        {
+            heartRateEst_FFT_4Hz[rangeBinIndex - obj->rangeBinStartIndex] /= 2;
+        }
+
+        //Decision block
+        heartRateEstDisplay  = Vote(heartRateEst_FFT, confidenceMetricHeartOut, rangeBinIndexPhase - obj->rangeBinStartIndex, VOTING_THRESH);
+        heartRateEstDisplay1 = Vote(heartRateEst_xCorr, confidenceMetricHeartOut, rangeBinIndexPhase - obj->rangeBinStartIndex, VOTING_THRESH);
+        heartRateEstDisplay2 = Vote(heartRateEst_FFT_4Hz, confidenceMetricHeartOut, rangeBinIndexPhase - obj->rangeBinStartIndex, VOTING_THRESH);
+
+
+        heartRateEstDisplay3 = VoteTwoPeaks(heartRateEst_FFT, confidenceMetricHeartOut, heartRateEst_FFT_max2, confidenceMetricHeartOut_max2, rangeBinIndexPhase - obj->rangeBinStartIndex, VOTING_THRESH,&score);
+       /*if(heartRateEst_FFT[0] > 115 && (heartRateEst_FFT[0] > xb*7.3 || fabs(heartRateEst_FFT[0]-xk) > fabs(heartRateEst_FFT[0]/2-xk)))//donc matnajem tkoun ken el harmonic el thenya //if(fabs(heartRate_FFT-xk) < fabs(heartRate_FFT/2-xk))
        {
-          for (loopIndexBuffer = 1; loopIndexBuffer < MEDIAN_WINDOW_LENGTH; loopIndexBuffer++)
-          {
-           obj->pBufferHeartRate[loopIndexBuffer - 1]     = obj->pBufferHeartRate[loopIndexBuffer];
-           obj->pBufferBreathingRate[loopIndexBuffer - 1] = obj->pBufferBreathingRate[loopIndexBuffer];
-           obj->pBufferHeartRate_4Hz[loopIndexBuffer - 1]     = obj->pBufferHeartRate_4Hz[loopIndexBuffer];
-          }
-       obj->pBufferHeartRate[MEDIAN_WINDOW_LENGTH - 1]     = heartRateEst_FFT;
-       obj->pBufferBreathingRate[MEDIAN_WINDOW_LENGTH - 1] = breathingRateEst_FFT;
-       obj->pBufferHeartRate_4Hz[MEDIAN_WINDOW_LENGTH - 1] = heartRateEst_FFT_4Hz;
-
-       heapsort_index(obj->pBufferHeartRate, MEDIAN_WINDOW_LENGTH,  obj->pPeakSortTempIndex);
-       heartRateEst_FFT = obj->pBufferHeartRate[ obj->pPeakSortTempIndex[MEDIAN_WINDOW_LENGTH/2+1]];
-
-       heapsort_index(obj->pBufferHeartRate_4Hz, MEDIAN_WINDOW_LENGTH,  obj->pPeakSortTempIndex);
-       heartRateEst_FFT_4Hz = obj->pBufferHeartRate_4Hz[ obj->pPeakSortTempIndex[MEDIAN_WINDOW_LENGTH/2+1]];
-
-       heapsort_index(obj->pBufferBreathingRate, MEDIAN_WINDOW_LENGTH,  obj->pPeakSortTempIndex);
-       breathingRateEst_FFT = obj->pBufferBreathingRate[ obj->pPeakSortTempIndex[MEDIAN_WINDOW_LENGTH/2+1]];
-       }
-
-       // Exponential Smoothing
-       breathWfmOutPrev = breathWfmOutUpdated;
-       breathWfmOutUpdated = (obj->alpha_breathing)*(outputFilterBreathOut*outputFilterBreathOut) + (1 - (obj->alpha_breathing))*breathWfmOutPrev; // Exponential Smoothing
-       sumEnergyBreathWfm = breathWfmOutUpdated*10000;
-
-       heartWfmOutPrev = heartWfmOutUpdated;
-       heartWfmOutUpdated = (obj->alpha_heart)*(outputFilterHeartOut*outputFilterHeartOut) + (1 - (obj->alpha_heart))*heartWfmOutPrev;  // Exponential Smoothing
-       sumEnergyHeartWfm = heartWfmOutUpdated*10000;
-
-       heartRateEst_FFT_4Hz /= 2;
-       // zyeda men and khouk el hech
-       //calculates the heartrate with 4 methodes and xhoosing the best output
-       static int8_t TheFirstFrame=1;
-       float heartRateEstDisplay;//added
-       float CM_combined;//added
-       static float xk = 0;//added
-       static float BreathingRate_Out = 17;//added
-       //float heartRate_OutMedian;
-       static float Pk = 1;
-       float test1,test2;
-       if(fabs(confidenceMetricHeartOut-79.6)< 0.1 ){
-           heartRateEstDisplay = heartRateEst_FFT;
-           test1=fabs(confidenceMetricHeartOut-79.6);
-           test2=0.1;
-       }
-       else if(heartRateEst_FFT > 115 && (heartRateEst_FFT > BreathingRate_Out*7.3 || fabs(heartRateEst_FFT-xk) > fabs(heartRateEst_FFT/2-xk)))//donc matnajem tkoun ken el harmonic el thenya //if(fabs(heartRate_FFT-xk) < abs(heartRate_FFT/2-xk))
+           heartRateEstDisplay = heartRateEst_FFT[0]/2;
+       }*//*
+       if(fabs(heartRateEst_FFT[0]-heartRateEst_xCorr[0]) < 3+(heartRateEst_FFT_4Hz[0]-50)/20)
        {
-           heartRateEstDisplay = heartRateEst_FFT/2;
-           test1=fabs(heartRateEst_FFT-xk);
-           test2=fabs(heartRateEst_FFT/2-xk);
+           heartRateEstDisplay = heartRateEst_FFT[0];
        }
-       else if(fabs(heartRateEst_FFT-heartRateEst_xCorr) < 3+(heartRateEst_FFT_4Hz-50)/20)
+       else if(fabs(heartRateEst_FFT_4Hz[0]-heartRateEst_FFT[0]) < 3+(heartRateEst_FFT_4Hz[0]-50)/20)
        {
-           heartRateEstDisplay = heartRateEst_FFT;
-           test1=fabs(heartRateEst_FFT-heartRateEst_xCorr);
-           test2= 3+(heartRateEst_FFT_4Hz-50)/20;
+           heartRateEstDisplay = heartRateEst_FFT[0];
        }
-       else if((fabs(heartRateEst_FFT_4Hz-heartRateEst_FFT)) < (3+((heartRateEst_FFT_4Hz-50)/20)))
+       else if(fabs(heartRateEst_FFT_4Hz[0]-heartRateEst_xCorr[0]) < 4+(heartRateEst_FFT_4Hz[0]-50)/20)
        {
-           heartRateEstDisplay = heartRateEst_FFT;
-           test1=fabs(heartRateEst_FFT_4Hz-heartRateEst_FFT);
-           test2= (3+((heartRateEst_FFT_4Hz-50)/20));
-       }
-       else if(fabs(heartRateEst_FFT_4Hz-heartRateEst_xCorr) < 4+(heartRateEst_FFT_4Hz-50)/20)
-       {
-           heartRateEstDisplay = heartRateEst_xCorr;
-           test1= fabs(heartRateEst_FFT_4Hz-heartRateEst_xCorr);
-           test2= 4+(heartRateEst_FFT_4Hz-50)/20;
+           heartRateEstDisplay = heartRateEst_xCorr[0];
        }
        else
        {
-           heartRateEstDisplay = heartRateEst_FFT;
-       }
-       //if (heartRateEstDisplay<48)heartRateEstDisplay= xk;
-
-       float removedVal = heartRateBuffer[gFrameCount % HEART_RATE_EST_MEDIAN_FLT_SIZE];
-       heartRateBuffer[gFrameCount % HEART_RATE_EST_MEDIAN_FLT_SIZE] = heartRateEstDisplay;
-
-       /*for (loopIndexBuffer = 1; loopIndexBuffer < HEART_RATE_EST_MEDIAN_FLT_SIZE - 1; loopIndexBuffer++)
-       {
-           if(heartRateBufferSort[loopIndexBuffer])
+           heartRateEstDisplay = heartRateEst_FFT[0];
        }*/
-       uint8_t addedValIndex   = binary_search(heartRateBufferSort, HEART_RATE_EST_MEDIAN_FLT_SIZE+2, heartRateEstDisplay);
-       uint8_t removedValIndex = binary_search(heartRateBufferSort, HEART_RATE_EST_MEDIAN_FLT_SIZE+2, removedVal);
-       if(abs(heartRateBufferSort[removedValIndex] - removedVal) > abs(heartRateBufferSort[removedValIndex - 1] - removedVal))
-           --removedValIndex;
 
-       if(addedValIndex == removedValIndex)
-           heartRateBufferSort[removedValIndex] = heartRateEstDisplay;
-       else if(removedValIndex < addedValIndex)
-       {
-           for(loopIndexBuffer = removedValIndex; loopIndexBuffer < addedValIndex - 1; ++loopIndexBuffer)
-           {
-               heartRateBufferSort[loopIndexBuffer] = heartRateBufferSort[loopIndexBuffer + 1];
-           }
-           heartRateBufferSort[addedValIndex - 1] = heartRateEstDisplay;
-       }
-       else
-       {
-           for(loopIndexBuffer = removedValIndex; loopIndexBuffer > addedValIndex; --loopIndexBuffer)
-           {
-               heartRateBufferSort[loopIndexBuffer] = heartRateBufferSort[loopIndexBuffer - 1];
-           }
-           heartRateBufferSort[addedValIndex] = heartRateEstDisplay;
-       }
-       float heartRate_OutMedian = heartRateBufferSort[HEART_RATE_EST_MEDIAN_FLT_SIZE/2+1];
+        //heartRate_OutMedian = Mediane(heartRateEstDisplay3, heartRateBuffer, heartRateBufferSort, HEART_RATE_EST_MEDIAN_FLT_SIZE, blockCount);
+        Mediane(heartRateEstDisplay3, heartRateBuffer, heartRateBufferSort, HEART_RATE_EST_MEDIAN_FLT_SIZE, 2*blockCount);
+        heartRate_OutMedian = Mediane(heartRateEstDisplay2, heartRateBuffer, heartRateBufferSort, HEART_RATE_EST_MEDIAN_FLT_SIZE, 2*blockCount+1);
 
 
-       // clacule heartrateout kalmann filter
-       if (TheFirstFrame)
-       {
-           xk=70;
-           TheFirstFrame = 0;
-       }
-       float heartRate_out;
-       float R;               // Measurement Variance
-       float Q;               // State Variance
-       float KF_Gain, CM2, diff=fabs(xk-heartRate_OutMedian);
-          if(gFrameCount<500){
-              CM2=0;
-          }
-          else if(diff>=6){
-              CM2 = -0.0532*diff+5.32;
-          }else{
-              CM2 = (diff/1.5-6.3)*(diff/1.5-6.3);
-          }
-       CM_combined = confidenceMetricHeartOut + confidenceMetricHeartOut_4Hz + 10*confidenceMetricHeartOut_xCorr;
-       CM_combined = CM_combined*3/2;
-       CM_combined += CM2;
-       CM_combined /= 2;
-       R = 1/(CM_combined + 0.0001);//9ad ma el CM increase 9ad ya3ti thi9a fel valeur eli jet//el 0.0001 bich matjich fel negative
-       Q = 1e-6;//l3aks //expected result eli bich tather fel thi9a
-       KF_Gain  = Pk/(Pk + R);
-       xk = xk + KF_Gain*(heartRate_OutMedian - xk);//=(1-KF_gain)*xk + KF_gain*heartRate_OutMedian;
-       Pk = (1-KF_Gain)*Pk + Q;// ki tji serie mta3 valeuret 3ando      el thi9a fihom ywali 3ado       thi9a fel valeuret el jeyin akther
-       heartRate_out = xk;     // ki tji serie mta3 valeuret ma3andouch el thi9a fihom ywali ma3andouch thi9a fel valeuret el jeyin akther
+        //kalmann filter
+        if(KALMAN_FILTER)
+        {
+            if (TheFirstFrame)
+            {
+                xk=70;
+                TheFirstFrame = 0;
+            }
+            float R;               // Measurement Variance
+            float Q;               // State Variance
+            float Pk = 1;
+            float CM_combined;
+            float KF_Gain, CM2=0, diff=fabs(xk-heartRate_OutMedian);
+            if(confidenceMetricHeartOut_xCorr[rangeBinIndexPhase - obj->rangeBinStartIndex] > 1.2)confidenceMetricHeartOut_xCorr[rangeBinIndexPhase - obj->rangeBinStartIndex] = 1.2;
+            if(gFrameCount<400){
+                CM_combined=8*confidenceMetricHeartOut_xCorr[rangeBinIndexPhase - obj->rangeBinStartIndex];
+            }
+            else if(diff>=6){
+                CM2 = -0.0532*diff+5.32;
+                CM_combined = 8*confidenceMetricHeartOut_xCorr[rangeBinIndexPhase - obj->rangeBinStartIndex] + CM2;
+            }else if(diff>= 12){
+                CM2 = (diff/1.5-6.3)*(diff/1.5-6.3);
+                CM_combined = 8*confidenceMetricHeartOut_xCorr[rangeBinIndexPhase - obj->rangeBinStartIndex] + CM2;
+            }
+            if(CM_combined > 16)CM_combined= 16;
 
-       BreathingRate_Out = 0.01*breathingRateEst_peakCount+(1-0.01)*BreathingRate_Out;
+            R = 1/(CM_combined + 0.0001);//9ad ma el CM increase 9ad ya3ti thi9a fel valeur eli jet//el 0.0001 bich matjich fel negative
+            Q = 1e-6;//l3aks //expected result eli bich tather fel thi9a
+            KF_Gain  = Pk/(Pk + R);
+            xk = xk + KF_Gain*(heartRate_OutMedian - xk);//=(1-KF_gain)*xk + KF_gain*heartRate_OutMedian;
+            Pk = (1-KF_Gain)*Pk + Q;// ki tji serie mta3 valeuret 3ando      el thi9a fihom ywali 3ado       thi9a fel valeuret el jeyin akther
+            heartRate_out = (int16_t)xk;     // ki tji serie mta3 valeuret ma3andouch el thi9a fihom ywali ma3andouch thi9a fel valeuret el jeyin akther
+        }
+        else
+        {
+            heartRate_out = heartRate_OutMedian;
+        }
 
+        if(breathHeld_Flag)//confidenceMetricBreathOut_xCorr[rangeBinIndexPhase - obj->rangeBinStartIndex] <= 0.002 || sumEnergyBreathWfm*peakValueBreathSpect/1000000 < 150
+        {
+            BreathingRate_Out = 0;
+        }
+        else
+        {
+            xb = 0.01*breathingRateEst_peakCount[rangeBinIndexPhase - obj->rangeBinStartIndex]+(1-0.01)*xb;
+            BreathingRate_Out = xb;
+        }
+        if(maxRCS_updated < minAmp*2/3)
+        {
+            heartRate_out = 0;
+            BreathingRate_Out = 0;
+        }
 
-       static float maxRCS_updated;
-       maxRCS_updated = ALPHA_RCS*maxVal + (1-ALPHA_RCS)*maxRCS_updated;
+        if(gFrameCount <500)
+            heartRate_out = 0;
+    }//block processing
 
-       float avg_period =60000/heartRate_out;
+    if(PERFORM_Heart_SFR)
+    {
+        if(heartRate_out != 0)
+        {
+            float avg_period = 60000.0 / (float)heartRate_out;
+            if((0 < JJ_period*50 && JJ_period*50 < avg_period-200) || (JJ_period*50 > avg_period+200) || maxRCS_updated < minAmp*2/3)// pas de personne
+            {
+                JJ_period = 0;
+            }
+        }
+        else
+            JJ_period = 0;
+    }
 
-       if((0 < period*50 && period*50 < avg_period-200) || (period*50 > avg_period+200) || maxRCS_updated < minAmp*2/3)// pas de personne
-           {
-           period = 0;
-           }
+    // Output Values
+    obj->VitalSigns_Output.unwrapPhasePeak_mm    = unrapPhasePeakTracked;//obj->unwrapPhasePeak;
+    obj->VitalSigns_Output.outputFilterBreathOut = outputFilterBreathOutTracked;
+    obj->VitalSigns_Output.outputFilterHeartOut  = outputFilterHeartOutTracked;
+    obj->VitalSigns_Output.rangeBinIndexPhase = rangeBinIndexPhase;                      //frameCountLocal;
+    obj->VitalSigns_Output.maxVal   = maxVal;
+    obj->VitalSigns_Output.sumEnergyHeartWfm  = confidenceMetricHeartOut[rangeBinIndexPhase - obj->rangeBinStartIndex+2];//sumEnergyHeartWfm;//confidenceMetricHeartOut[rangeBinIndexPhase - obj->rangeBinStartIndex+2]
+    obj->VitalSigns_Output.sumEnergyBreathWfm = confidenceMetricHeartOut_max2[rangeBinIndexPhase - obj->rangeBinStartIndex+2];//sumEnergyBreathWfm*peakValueBreathSpect/1000;//confidenceMetricHeartOut_max2[rangeBinIndexPhase - obj->rangeBinStartIndex+2]
 
-       // Output Values
-       obj->VitalSigns_Output.unwrapPhasePeak_mm    = obj->unwrapPhasePeak;
-       obj->VitalSigns_Output.outputFilterBreathOut = outputFilterBreathOut;
-       obj->VitalSigns_Output.outputFilterHeartOut  = outputFilterHeartOut;
-       obj->VitalSigns_Output.rangeBinIndexPhase = rangeBinIndexPhase;
-       obj->VitalSigns_Output.maxVal   = maxVal;
-       obj->VitalSigns_Output.sumEnergyHeartWfm  = sumEnergyHeartWfm;
-       obj->VitalSigns_Output.sumEnergyBreathWfm = sumEnergyBreathWfm*peakValueBreathSpect;
+    obj->VitalSigns_Output.confidenceMetricBreathOut = confidenceMetricHeartOut_max2[rangeBinIndexPhase - obj->rangeBinStartIndex-1];//confidenceMetricBreathOut[rangeBinIndexPhase - obj->rangeBinStartIndex];
+    obj->VitalSigns_Output.confidenceMetricHeartOut = confidenceMetricHeartOut[rangeBinIndexPhase - obj->rangeBinStartIndex-1];          // Confidence Metric associated with the estimates
+    obj->VitalSigns_Output.confidenceMetricHeartOut_4Hz = confidenceMetricHeartOut[rangeBinIndexPhase - obj->rangeBinStartIndex+1];//confidenceMetricHeartOut_4Hz[rangeBinIndexPhase - obj->rangeBinStartIndex];
+    obj->VitalSigns_Output.confidenceMetricHeartOut_xCorr = confidenceMetricHeartOut[rangeBinIndexPhase - obj->rangeBinStartIndex];//confidenceMetricHeartOut_xCorr[rangeBinIndexPhase - obj->rangeBinStartIndex];
 
-       obj->VitalSigns_Output.confidenceMetricBreathOut = confidenceMetricBreathOut;
-       obj->VitalSigns_Output.confidenceMetricHeartOut = confidenceMetricHeartOut;          // Confidence Metric associated with the estimates
-       obj->VitalSigns_Output.confidenceMetricHeartOut_4Hz = confidenceMetricHeartOut_4Hz;//heartRate_OutMedian;//period;//pPeakLocsValid[numPeaksBreath-1];//confidenceMetricHeartOut_4Hz;
-       obj->VitalSigns_Output.confidenceMetricHeartOut_xCorr = confidenceMetricHeartOut_xCorr;
+    obj->VitalSigns_Output.breathingRateEst_FFT =  heartRateEst_FFT_max2[rangeBinIndexPhase - obj->rangeBinStartIndex];//breathingRateEst_FFT[rangeBinIndexPhase - obj->rangeBinStartIndex];
+    obj->VitalSigns_Output.breathingRateEst_peakCount = heartRateEst_FFT_max2[rangeBinIndexPhase - obj->rangeBinStartIndex-1];//breathingRateEst_peakCount[rangeBinIndexPhase - obj->rangeBinStartIndex];
+    obj->VitalSigns_Output.heartRateEst_peakCount_filtered = heartRateEst_FFT[rangeBinIndexPhase - obj->rangeBinStartIndex-1];//heartRateEst_peakCount_filtered;
+    obj->VitalSigns_Output.heartRateEst_xCorr = heartRateEst_FFT[rangeBinIndexPhase - obj->rangeBinStartIndex+1];//heartRateEst_xCorr[rangeBinIndexPhase - obj->rangeBinStartIndex];
+    obj->VitalSigns_Output.heartRateEst_FFT_4Hz = heartRateEst_FFT[rangeBinIndexPhase - obj->rangeBinStartIndex+2];//heartRateEst_FFT_4Hz[rangeBinIndexPhase - obj->rangeBinStartIndex];
+    obj->VitalSigns_Output.heartRateEst_FFT = heartRateEst_FFT[rangeBinIndexPhase - obj->rangeBinStartIndex];
 
-       obj->VitalSigns_Output.breathingRateEst_FFT = breathingRateEst_FFT;//removedValIndex;//lastPeak;//breathingRateEst_FFT;
-       obj->VitalSigns_Output.breathingRateEst_peakCount = breathingRateEst_peakCount;
-       obj->VitalSigns_Output.heartRateEst_peakCount_filtered = heartRateEst_peakCount_filtered;
-       obj->VitalSigns_Output.heartRateEst_xCorr = heartRateEst_xCorr;
-       obj->VitalSigns_Output.heartRateEst_FFT_4Hz = heartRateEst_FFT_4Hz;
-       obj->VitalSigns_Output.heartRateEst_FFT = heartRateEst_FFT;
+    obj->VitalSigns_Output.processingCyclesOut = obj->timingInfo.interFrameProcCycles/DSP_CLOCK_MHZ;
+    obj->VitalSigns_Output.rangeBinStartIndex = obj->rangeBinStartIndex;
+    obj->VitalSigns_Output.rangeBinEndIndex = obj->rangeBinEndIndex;
+    obj->VitalSigns_Output.motionDetectedFlag = obj->motionDetected;
+    obj->VitalSigns_Output.breathingRateEst_xCorr = heartRateEst_FFT_max2[rangeBinIndexPhase - obj->rangeBinStartIndex+1];//breathRateEst_xCorr[rangeBinIndexPhase - obj->rangeBinStartIndex];
+    obj->VitalSigns_Output.confidenceMetricBreathOut_xCorr = confidenceMetricHeartOut_max2[rangeBinIndexPhase - obj->rangeBinStartIndex];//confidenceMetricBreathOut_xCorr[rangeBinIndexPhase - obj->rangeBinStartIndex];
+    obj->VitalSigns_Output.breathingRateEst_harmonicEnergy = heartRateEst_FFT_max2[rangeBinIndexPhase - obj->rangeBinStartIndex+2];//breathRateEst_HarmonicEnergy;
+    obj->VitalSigns_Output.heartRateEst_harmonicEnergy = heartRateEst_HarmonicEnergy;
 
-       obj->VitalSigns_Output.processingCyclesOut = obj->timingInfo.interFrameProcCycles/DSP_CLOCK_MHZ;
-       obj->VitalSigns_Output.rangeBinStartIndex = obj->rangeBinStartIndex;
-       obj->VitalSigns_Output.rangeBinEndIndex = obj->rangeBinEndIndex;
-       obj->VitalSigns_Output.motionDetectedFlag = obj->motionDetected;//removedVal;//numPeaksHeart;//inverse;//inverse;//frameCountLocal;//obj->motionDetected;
-       obj->VitalSigns_Output.breathingRateEst_xCorr = breathRateEst_xCorr;//pPeakLocsHeart[numPeaksHeart-1];//test;//breathRateEst_xCorr                            //breathRateEst_HarmonicEnergy;
-       obj->VitalSigns_Output.confidenceMetricBreathOut_xCorr = confidenceMetricBreathOut_xCorr;
-       obj->VitalSigns_Output.breathingRateEst_harmonicEnergy = breathRateEst_HarmonicEnergy;
-       obj->VitalSigns_Output.reserved7 = heartRate_out;
-       obj->VitalSigns_Output.reserved8 = BreathingRate_Out;
-       obj->VitalSigns_Output.reserved9 = (float)period;
-       obj->VitalSigns_Output.reserved10 = heartRate_OutMedian;
-       obj->VitalSigns_Output.reserved11 = heartRateEstDisplay;
-       //obj->VitalSigns_Output.reserved12 = ;
-       //obj->VitalSigns_Output.reserved13 = ;
-       //obj->VitalSigns_Output.reserved14 = ;
-
-}
+    obj->VitalSigns_Output.heartRate_Out     = heartRate_out;//heartRateEstDisplay2;//heartRate_out;//heartRateEstDisplay3//heartRate_out
+    obj->VitalSigns_Output.BreathingRate_Out = BreathingRate_Out;//BreathingRate_Out;
+    obj->VitalSigns_Output.plotSwitching     = plotSwitching+1;
+    obj->VitalSigns_Output.reserved8 =  test1;
+    obj->VitalSigns_Output.reserved9  = 0;//(float)JJ_period;
+    obj->VitalSigns_Output.reserved10 = obj->timingInfo.interFrameProcessingEndMargin/DSP_CLOCK_MHZ;//heartRateEstDisplay
+    obj->VitalSigns_Output.reserved11 = obj->timingInfo.interFrameProcCycles/DSP_CLOCK_MHZ;//obj->timingInfo.interFrameProcCycles/DSP_CLOCK_MHZ//heartRateEstDisplay1
+    obj->VitalSigns_Output.reserved12 = heartRate_OutMedian;//score
+    obj->VitalSigns_Output.reserved13 = heartRateEstDisplay3;
+    obj->VitalSigns_Output.reserved14 = confidenceMetricHeartOut_max2[rangeBinIndexPhase - obj->rangeBinStartIndex+1];
+  }
 
 
 /**
@@ -3682,7 +3814,7 @@ void MmwDemo_dataPathInitVitalSigns(MmwDemo_DSS_DataPathObj *obj)
     obj->circularBufferSizeBreath   = vitalSignsParamCLI.winLen_breathing;
     obj->rxAntennaProcess           = vitalSignsParamCLI.rxAntennaProcess;
     obj->alpha_breathing            = vitalSignsParamCLI.alpha_breathingWfm;
-    obj->alpha_heart                = vitalSignsParamCLI.alpha_heartWfm;
+    obj->alpha_heart                = (float)vitalSignsParamCLI.alpha_heartWfm;
     obj->scale_breathingWfm         = vitalSignsParamCLI.scale_breathingWfm;
     obj->scale_heartWfm             = vitalSignsParamCLI.scale_heartWfm;
 
@@ -3693,7 +3825,7 @@ void MmwDemo_dataPathInitVitalSigns(MmwDemo_DSS_DataPathObj *obj)
     obj->samplingFreq_Hz = (float) 1000 / (obj->framePeriodicity_ms); // 1000 to convert from ms to seconds
     obj->freqIncrement_Hz = obj->samplingFreq_Hz  / PHASE_FFT_SIZE;
 
-    obj->noiseImpulse_Thresh   = 1.5;
+    obj->noiseImpulse_Thresh   = 1.5;//1.5;
     obj->motionDetection_Thresh = obj->cliCfg->motionDetectionParamsCfg.threshold;      //1.0;   // Threshold for Large Motions
     obj->motionDetection_BlockSize = obj->cliCfg->motionDetectionParamsCfg.blockSize;   //20;    // Block Size for Large Motion
 
@@ -3715,7 +3847,7 @@ void MmwDemo_dataPathInitVitalSigns(MmwDemo_DSS_DataPathObj *obj)
     obj->breath_endFreq_Hz   = 0.6;   // Breathing-Rate peak search End-Frequency
 
     obj->heart_startFreq_Hz = 0.8;    // Heart-Rate peak search Start-Frequency
-    obj->heart_endFreq_Hz   = 2;    // Heart-Rate peak search End-Frequency
+    obj->heart_endFreq_Hz   = 2.0;    // Heart-Rate peak search End-Frequency
 
     obj->heart_startFreq_Index = floor(obj->heart_startFreq_Hz / obj->freqIncrement_Hz);
     obj->heart_endFreq_Index   = ceil(obj->heart_endFreq_Hz / obj->freqIncrement_Hz);
@@ -3737,7 +3869,7 @@ void MmwDemo_dataPathInitVitalSigns(MmwDemo_DSS_DataPathObj *obj)
     obj->scaleFactor_PhaseToDisp = WAVELENGTH_MM/(4*PI_);
 
     // Auto-Correlation
-    obj->xCorr_minLag = (uint16_t) obj->samplingFreq_Hz/2.1;    // (Fs/Freq)  Corresponding to f = 2.1 Hz at a sampling Frequency of 20 Hz
+    obj->xCorr_minLag = (uint16_t) obj->samplingFreq_Hz/2.0;//2.1    // (Fs/Freq)  Corresponding to f = 2.1 Hz at a sampling Frequency of 20 Hz
     obj->xCorr_maxLag = (uint16_t) obj->samplingFreq_Hz/0.8;    // (Fs/Freq)  Corresponding to f = 0.8 Hz at a sampling Frequency of 20 Hz
     obj->xCorr_Breath_minLag = (uint16_t) obj->samplingFreq_Hz/obj->breath_endFreq_Hz;    // (Fs/Freq)  Corresponding to f = 0.6 Hz at a sampling Frequency of 20 Hz
     obj->xCorr_Breath_maxLag = (uint16_t) obj->samplingFreq_Hz/obj->breath_startFreq_Hz;    // (Fs/Freq)  Corresponding to f = 0.1 Hz at a sampling Frequency of 20 Hz
@@ -3906,12 +4038,12 @@ void MmwDemo_dataPathConfigBuffers(MmwDemo_DSS_DataPathObj *obj, uint32_t adcBuf
 #endif
 
     MMW_ALLOC_BUF(adcDataIn, cmplx16ReIm_t,
-		heapL1start, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
+        heapL1start, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
         2 * obj->numRangeBins);
     memset((void *)obj->adcDataIn, 0, 2 * obj->numRangeBins * sizeof(cmplx16ReIm_t));
 
     MMW_ALLOC_BUF(dstPingPong, cmplx16ReIm_t,
-		heapL1start, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
+        heapL1start, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
         2 * obj->numDopplerBins);
 
 #ifndef NO_L1_ALLOC
@@ -3957,8 +4089,12 @@ void MmwDemo_dataPathConfigBuffers(MmwDemo_DSS_DataPathObj *obj, uint32_t adcBuf
 #endif
 
     MMW_ALLOC_BUF(fftOut1D, cmplx16ReIm_t,
-		heapL2start, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
+        heapL2start, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
         2 * obj->numRxAntennas * obj->numRangeBins);
+
+    MMW_ALLOC_BUF(meanfft, cmplx16ReIm_t,
+        heapL2start, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
+        obj->numRxAntennas * obj->numRangeBins);//meanfft
 
     MMW_ALLOC_BUF(cfarDetObjIndexBuf, uint16_t,
         heapL2start, sizeof(uint16_t),
@@ -3972,12 +4108,12 @@ void MmwDemo_dataPathConfigBuffers(MmwDemo_DSS_DataPathObj *obj, uint32_t adcBuf
 
 #ifdef NO_OVERLAY
     obj->detDopplerLines.dopplerLineMask = (uint32_t *) ALIGN(prev_end,
-		SYS_MEMORY_ALLOC_MAX_STRUCT_BYTE_ALIGNMENT_DSP);
+        SYS_MEMORY_ALLOC_MAX_STRUCT_BYTE_ALIGNMENT_DSP);
     prev_end = (uint32_t)obj->detDopplerLines.dopplerLineMask  +
                 MAX((obj->numDopplerBins>>5),1) * sizeof(uint32_t);
 #else
     obj->detDopplerLines.dopplerLineMask = (uint32_t *) ALIGN(cfarDetObjIndexBuf_end,
-		SYS_MEMORY_ALLOC_MAX_STRUCT_BYTE_ALIGNMENT_DSP);
+        SYS_MEMORY_ALLOC_MAX_STRUCT_BYTE_ALIGNMENT_DSP);
     uint32_t detDopplerLines_dopplerLineMask_end = (uint32_t)obj->detDopplerLines.dopplerLineMask  +
                 MAX((obj->numDopplerBins>>5),1) * sizeof(uint32_t);
 #endif
@@ -3990,16 +4126,16 @@ void MmwDemo_dataPathConfigBuffers(MmwDemo_DSS_DataPathObj *obj, uint32_t adcBuf
 
     MMW_ALLOC_BUF(twiddle16x16_1D, cmplx16ReIm_t,
         MAX(fftOut1D_end, sumAbsRange_end),
-		SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
+        SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
         obj->numRangeBins);
 
     MMW_ALLOC_BUF(window1D, int16_t,
-		twiddle16x16_1D_end, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
+        twiddle16x16_1D_end, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
         obj->numAdcSamples / 2);
 
-	MMW_ALLOC_BUF(twiddle32x32_2D, cmplx32ReIm_t,
-		window1D_end, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
-		obj->numDopplerBins);
+    MMW_ALLOC_BUF(twiddle32x32_2D, cmplx32ReIm_t,
+        window1D_end, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
+        obj->numDopplerBins);
 
     MMW_ALLOC_BUF(window2D, int32_t,
         window1D_end, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
@@ -4049,11 +4185,11 @@ void MmwDemo_dataPathConfigBuffers(MmwDemo_DSS_DataPathObj *obj, uint32_t adcBuf
 
     MMW_ALLOC_BUF(pVitalSigns_Breath_CircularBuffer, float,
                   pRangeProfileCplx_end, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
-                  obj->circularBufferSizeBreath);
+                  obj->circularBufferSizeBreath*NUM_RANGEBINS_PROC);
 
     MMW_ALLOC_BUF(pVitalSigns_Heart_CircularBuffer, float,
                   pVitalSigns_Breath_CircularBuffer_end, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
-                  obj->circularBufferSizeHeart);
+                  obj->circularBufferSizeHeart*NUM_RANGEBINS_PROC);
 
     MMW_ALLOC_BUF(pMotionCircularBuffer, float,
                   pVitalSigns_Heart_CircularBuffer_end, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
@@ -4083,8 +4219,12 @@ void MmwDemo_dataPathConfigBuffers(MmwDemo_DSS_DataPathObj *obj, uint32_t adcBuf
                   pVitalSigns_Breath_AbsSpectrum_end, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
                   obj->heartWfm_Spectrum_FftSize);
 
-    MMW_ALLOC_BUF(pFilterCoefsBreath, float,
+    MMW_ALLOC_BUF(pAbsSpectrum, float,
                   pVitalSigns_Heart_AbsSpectrum_end, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
+                  obj->heartWfm_Spectrum_FftSize);
+
+    MMW_ALLOC_BUF(pFilterCoefsBreath, float,
+                  pAbsSpectrum_end, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
                   IIR_FILTER_BREATH_NUM_STAGES * IIR_FILTER_COEFS_SECOND_ORDER);
 
     MMW_ALLOC_BUF(pScaleValsBreath, float,
@@ -4106,6 +4246,7 @@ void MmwDemo_dataPathConfigBuffers(MmwDemo_DSS_DataPathObj *obj, uint32_t adcBuf
     MMW_ALLOC_BUF(pTempReal_Prev, float,
                   pXcorr_4Hz_end, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
                   obj->numRangeBins);
+    //memset((void *)obj->pTempReal_Prev, 0, obj->numRangeBins * sizeof(float));
 
     MMW_ALLOC_BUF(pTempImag_Prev, float,
                   pTempReal_Prev_end, SYS_MEMORY_ALLOC_DOUBLE_WORD_ALIGN_DSP,
@@ -4169,12 +4310,12 @@ void MmwDemo_dataPathConfigFFTs(MmwDemo_DSS_DataPathObj *obj)
                         obj->numAdcSamples,
                         obj->numAdcSamples/2,
                         ONE_Q15,
-                        MMW_WIN_BLACKMAN);
+                        MMW_WIN_HANNING);//MMW_WIN_BLACKMAN//MMW_WIN_HANNING
 
     /* Generate twiddle factors for 1D FFT. This is one time */
     MmwDemo_gen_twiddle_fft16x16_fast((int16_t *)obj->twiddle16x16_1D, obj->numRangeBins);
-	
-	/* Generate twiddle factors for vital signs FFT operation. This is one time */
+
+    /* Generate twiddle factors for vital signs FFT operation. This is one time */
     MmwDemo_gen_twiddle_fft32x32_fast((int32_t *)obj->pVitalSignsSpectrumTwiddle32x32, obj->breathingWfm_Spectrum_FftSize, 2147483647.5);
 }
 
