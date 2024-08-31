@@ -2708,14 +2708,9 @@ void MmwDemo_interFrameProcessing(MmwDemo_DSS_DataPathObj *obj, uint32_t frameIn
     float test1,test2 = 0.1,test3,test4,score;
     if (pGuiMonSel->guiFlag_Reset  == 1)   // Refresh Pushbutton on the GUI Pressed
     {
-        //gFrameCount = 1;
         pGuiMonSel->guiFlag_Reset = 0;
         breathWfmOutUpdated = 0;
         heartWfmOutUpdated = 0;
-        /*guiFlag_Meanfft = 1 - guiFlag_Meanfft;
-         obj->rxAntennaProcess += 1;
-         bj->rxAntennaProcess = obj->rxAntennaProcess % 4;
-         if(obj->rxAntennaProcess == 0)obj->rxAntennaProcess+=1;*/
     }
 
     rangeBinMax = 0;
@@ -2786,33 +2781,19 @@ void MmwDemo_interFrameProcessing(MmwDemo_DSS_DataPathObj *obj, uint32_t frameIn
 
         rangeBinPhase = atan2(temp_imag, temp_real);
 
-        //if (rangeBinIndex == rangeBinIndexPhase)//si -1 donc rangeBinMax mete5ouch el start 5ater el start-1 mahouch traiter
-        //{
         obj->unwrapPhasePeak = unwrap(rangeBinPhase, phasePrevFrame[rangeBinIndex - obj->rangeBinStartIndex], &diffPhaseCorrectionCum[rangeBinIndex - obj->rangeBinStartIndex],0);//(rangeBinIndexPhase)!=rangeBinIndexPhaseprev);
         phasePrevFrame[rangeBinIndex - obj->rangeBinStartIndex] = rangeBinPhase;
+        
         //rangeBinIndexPhaseprev = rangeBinIndexPhase;
         if(FLAG_COMPUTE_PHASE_DIFFERENCE)
         {
-           /* holdingBreath++;
-            if(holdingBreath > 70)
-                breathHeld_Flag = 1;*/
-
-
             if(phaseUsedComputation[rangeBinIndex - obj->rangeBinStartIndex]*(obj->unwrapPhasePeak - phaseUsedComputationPrev[rangeBinIndex - obj->rangeBinStartIndex]) < 0)
             {
                 inverse[rangeBinIndex - obj->rangeBinStartIndex] += 5;
-
-               /* //holding breath test
-                breathHeld_Count = 0;*/
             }
             else
             {
                 inverse[rangeBinIndex - obj->rangeBinStartIndex] -= 2;
-
-                /*//holding breath test
-                breathHeld_Count++;
-                if(breathHeld_Count > 30)
-                    holdingBreath = 0;*/
             }
 
             phaseUsedComputation[rangeBinIndex - obj->rangeBinStartIndex] = obj->unwrapPhasePeak - phaseUsedComputationPrev[rangeBinIndex - obj->rangeBinStartIndex];
@@ -2834,9 +2815,7 @@ void MmwDemo_interFrameProcessing(MmwDemo_DSS_DataPathObj *obj, uint32_t frameIn
         // IIR Filtering
         outputFilterBreathOut = filter_IIR_BiquadCascade(phaseUsedComputation[rangeBinIndex - obj->rangeBinStartIndex], obj->pFilterCoefsBreath, obj->pScaleValsBreath, obj->pDelayBreath[rangeBinIndex - obj->rangeBinStartIndex], IIR_FILTER_BREATH_NUM_STAGES);
         outputFilterHeartOut  = filter_IIR_BiquadCascade(phaseUsedComputation[rangeBinIndex - obj->rangeBinStartIndex], obj->pFilterCoefsHeart_4Hz, obj->pScaleValsHeart_4Hz, obj->pDelayHeart[rangeBinIndex - obj->rangeBinStartIndex], IIR_FILTER_HEART_NUM_STAGES);
-
-        //outputFilterHeartOut = phaseUsedComputation[rangeBinIndex - obj->rangeBinStartIndex];
-        //outputFilterHeartOut= outputFilterBreathOut;
+        
         // Copies the "Breathing Waveform" in a circular Buffer
         for (loopIndexBuffer = 1; loopIndexBuffer < obj->circularBufferSizeBreath; loopIndexBuffer++)
         {
@@ -2920,22 +2899,7 @@ void MmwDemo_interFrameProcessing(MmwDemo_DSS_DataPathObj *obj, uint32_t frameIn
             }
             else
                 breathHeld_Count = 0;
-
-            /*//holding breath event test
-            if(fabs(phaseUsedComputation[rangeBinIndex - obj->rangeBinStartIndex]) < 0.2)
-            {
-                breathHeld_Count++;
-                if(breathHeld_Count > 70)
-                    breathHeld_Flag = 1;
-            }
-            else
-            {
-                breathHeld_Count -= 10;
-                if(breathHeld_Count < 0)
-                    breathHeld_Count = 0;
-            }*/
         }
-        //}
         } // For Loop ends
 
     // Computes the phase differences between successive phase samples
@@ -2979,87 +2943,11 @@ void MmwDemo_interFrameProcessing(MmwDemo_DSS_DataPathObj *obj, uint32_t frameIn
         if(rangeBinBufferhisto[rangeBinIndexFrequent] < rangeBinBufferhisto[rangeBinMax])
         {
             rangeBinIndexPhase = rangeBinMax;
-            /*
-            if((rangeBinIndexPhase < rangeBinMax) && (rangeBinIndexPhase < rangeBinIndexFrequent))
-            {
-                rangeBinIndexPhase = rangeBinMax;
-                if(rangeBinIndexFrequent < rangeBinMax)
-                    rangeBinIndexPhase = rangeBinIndexFrequent;
-                //rangeBinIndexPhase += 0.2;
-                //inverse = 0;
-            }
-            if((rangeBinIndexPhase > rangeBinMax) && (rangeBinIndexPhase > rangeBinIndexFrequent))
-            {
-                rangeBinIndexPhase = rangeBinMax;
-                if(rangeBinIndexFrequent > rangeBinMax)
-                    rangeBinIndexPhase = rangeBinIndexFrequent;
-                //rangeBinIndexPhase -= 0.2;
-                //inverse = 0;
-            }*/
             rangeBinIndexFrequent  = rangeBinMax;
         }
     }
 
-    /*/average filter to the range bin changes
-    static float notfiltredrangeBinIndex=20;
-    float alphaBin=0.02;
-    static counter=0;
-    if(abs(rangeBinIndexFrequent-notfiltredrangeBinIndex) < 4)
-    {
-        if(rangeBinIndexFrequent > notfiltredrangeBinIndex) ++counter;
-        else if(rangeBinIndexFrequent < notfiltredrangeBinIndex) --counter;
-        alphaBin = abs(counter);
-        notfiltredrangeBinIndex = alphaBin * rangeBinIndexFrequent + (1 - alphaBin) * notfiltredrangeBinIndex;
-        rangeBinIndexPhase = (int) notfiltredrangeBinIndex;
-    }*/
-
-    /*/el moyenne
-    int16_t s=0;
-    int8_t i;
-    for( i = 0;i < RANGE_BIN_BUFFER_SIZE;i++){
-        s+=rangeBinBuffer[i];
-    }
-    rangeBinIndexPhase = s/RANGE_BIN_BUFFER_SIZE;*/
-
     /* Spectral Estimation and JJ singal extraction based on the Shape form recognition method */
-    if(PERFORM_Heart_SFR)
-    {
-        numPeaksHeart  = shape_form_recognition(obj->pVitalSigns_Heart_CircularBuffer, pPeakLocsHeart,obj->pPeakValues, 0, obj->circularBufferSizeHeart  - 1,
-                                                obj->peakDistanceHeart_Min, obj->peakDistanceHeart_Max);
-
-        /*lastPeak -= obj->motionDetection_BlockSize;
-         if(numPeaksHeart >= 2 && pPeakLocsHeart[numPeaksHeart-1] != lastPeak)
-         {
-         JJ_period = pPeakLocsHeart[numPeaksHeart-1] - pPeakLocsHeart[numPeaksHeart-2];
-         lastPeak = pPeakLocsHeart[numPeaksHeart-1];
-         //prelastPeak = pPeakLocsHeart[numPeaksHeart-2];
-         }
-         else
-         {
-            JJ_period = -2;
-         }  */
-        lastPeak -= 1;
-        if(numPeaksHeart)
-        {
-            if(pPeakLocsHeart[numPeaksHeart-1] > lastPeak+2) //+2 cause gain control may make translation in the position of the heart peak so the +2 avoid detecting the same heart peak.
-            {
-                JJ_period = pPeakLocsHeart[numPeaksHeart-1] - lastPeak;
-                lastPeak = pPeakLocsHeart[numPeaksHeart-1];
-            }
-            else if(pPeakLocsHeart[numPeaksHeart-1] == lastPeak)
-            {
-                JJ_period = -1;
-            }
-            else
-            {
-                JJ_period = -3;
-            }
-        }
-        else
-        {
-            JJ_period = -2;
-        }
-    }
 
     float heartRateEst_HarmonicEnergy;
     float breathRateEst_HarmonicEnergy;
@@ -3304,18 +3192,6 @@ void MmwDemo_interFrameProcessing(MmwDemo_DSS_DataPathObj *obj, uint32_t frameIn
                                                                                                                                       maxIndexBreathSpect);
                 }
                 heartRateEst_FFT_4Hz[rangeBinIndex - obj->rangeBinStartIndex]  = (float) CONVERT_HZ_BPM * maxIndexHeartBeatSpect_4Hz * (obj->freqIncrement_Hz);
-
-                // If a peak is within [1.6 2.0] Hz then check if a harmonic is present is the cardiac spectrum region [0.8 - 2.0] Hz
-                /*if (heartRateEst_FFT_4Hz[rangeBinIndex - obj->rangeBinStartIndex] < MAX_HEART_RATE_BPM)
-                {
-                    for (indexTemp =1; indexTemp<numPeaks_heartSpectrum;indexTemp++)
-
-                        if(fabs(heartRateEst_FFT_4Hz[rangeBinIndex - obj->rangeBinStartIndex] - CONVERT_HZ_BPM *(obj->freqIncrement_Hz)*pPeakSortOutIndex[indexTemp]) < HEART_HAMRONIC_THRESH_BPM)
-                        {
-                            heartRateEst_FFT_4Hz[rangeBinIndex - obj->rangeBinStartIndex] = CONVERT_HZ_BPM *(obj->freqIncrement_Hz)*pPeakSortOutIndex[indexTemp];
-                            break;
-                        }
-                }*/
             }
 
             if(PERFORM_Heart_FFT_2hz)
@@ -3433,21 +3309,6 @@ void MmwDemo_interFrameProcessing(MmwDemo_DSS_DataPathObj *obj, uint32_t frameIn
             breathingRateEst_FFT[0] = obj->pBufferBreathingRate[ obj->pPeakSortTempIndex[MEDIAN_WINDOW_LENGTH/2+1]];
         }
 
-        /*if (guiFlag_MotionDetection == 1)
-        {
-            outputFilterHeartOutTracked =  obj->pMotionCircularBuffer[obj->motionDetection_BlockSize-1];
-        }
-        else
-        {
-            outputFilterHeartOutTracked = obj->pVitalSigns_Heart_CircularBuffer[(rangeBinIndexPhase - obj->rangeBinStartIndex)*obj->circularBufferSizeHeart + obj->circularBufferSizeHeart - 1];
-            //el valeur initiale mta3 el rangeBinIndexPhase tnajem tkoun mehech mawjoda donc ta3ti nan lel hwf
-        }*/
-
-        // Exponential Smoothing
-        /*breathWfmOutPrev = breathWfmOutUpdated;
-        breathWfmOutUpdated = (obj->alpha_breathing )*(outputFilterBreathOutTracked*outputFilterBreathOutTracked) + (1 - obj->alpha_breathing)*breathWfmOutPrev; // Exponential Smoothing
-        sumEnergyBreathWfm = breathWfmOutUpdated*10000;*/
-
         heartWfmOutPrev = heartWfmOutUpdated;
         heartWfmOutUpdated = (obj->alpha_heart )*(outputFilterHeartOutTracked*outputFilterHeartOutTracked) + (1 - obj->alpha_heart)*heartWfmOutPrev;  // Exponential Smoothing
         sumEnergyHeartWfm = heartWfmOutUpdated*10000;
@@ -3464,31 +3325,9 @@ void MmwDemo_interFrameProcessing(MmwDemo_DSS_DataPathObj *obj, uint32_t frameIn
 
 
         heartRateEstDisplay3 = VoteTwoPeaks(heartRateEst_FFT, confidenceMetricHeartOut, heartRateEst_FFT_max2, confidenceMetricHeartOut_max2, rangeBinIndexPhase - obj->rangeBinStartIndex, VOTING_THRESH,&score);
-       /*if(heartRateEst_FFT[0] > 115 && (heartRateEst_FFT[0] > xb*7.3 || fabs(heartRateEst_FFT[0]-xk) > fabs(heartRateEst_FFT[0]/2-xk)))//donc matnajem tkoun ken el harmonic el thenya //if(fabs(heartRate_FFT-xk) < fabs(heartRate_FFT/2-xk))
-       {
-           heartRateEstDisplay = heartRateEst_FFT[0]/2;
-       }*//*
-       if(fabs(heartRateEst_FFT[0]-heartRateEst_xCorr[0]) < 3+(heartRateEst_FFT_4Hz[0]-50)/20)
-       {
-           heartRateEstDisplay = heartRateEst_FFT[0];
-       }
-       else if(fabs(heartRateEst_FFT_4Hz[0]-heartRateEst_FFT[0]) < 3+(heartRateEst_FFT_4Hz[0]-50)/20)
-       {
-           heartRateEstDisplay = heartRateEst_FFT[0];
-       }
-       else if(fabs(heartRateEst_FFT_4Hz[0]-heartRateEst_xCorr[0]) < 4+(heartRateEst_FFT_4Hz[0]-50)/20)
-       {
-           heartRateEstDisplay = heartRateEst_xCorr[0];
-       }
-       else
-       {
-           heartRateEstDisplay = heartRateEst_FFT[0];
-       }*/
 
-        //heartRate_OutMedian = Mediane(heartRateEstDisplay3, heartRateBuffer, heartRateBufferSort, HEART_RATE_EST_MEDIAN_FLT_SIZE, blockCount);
         Mediane(heartRateEstDisplay3, heartRateBuffer, heartRateBufferSort, HEART_RATE_EST_MEDIAN_FLT_SIZE, 2*blockCount);
         heartRate_OutMedian = Mediane(heartRateEstDisplay2, heartRateBuffer, heartRateBufferSort, HEART_RATE_EST_MEDIAN_FLT_SIZE, 2*blockCount+1);
-
 
         //kalmann filter
         if(KALMAN_FILTER)
@@ -3528,7 +3367,7 @@ void MmwDemo_interFrameProcessing(MmwDemo_DSS_DataPathObj *obj, uint32_t frameIn
             heartRate_out = heartRate_OutMedian;
         }
 
-        if(breathHeld_Flag)//confidenceMetricBreathOut_xCorr[rangeBinIndexPhase - obj->rangeBinStartIndex] <= 0.002 || sumEnergyBreathWfm*peakValueBreathSpect/1000000 < 150
+        if(breathHeld_Flag)
         {
             BreathingRate_Out = 0;
         }
